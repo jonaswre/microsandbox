@@ -14,7 +14,7 @@ use oci_client::{
 };
 use oci_spec::image::MediaType;
 use sqlx::{
-    ConnectOptions, Pool, Row, Sqlite,
+    Pool, Row, Sqlite,
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
