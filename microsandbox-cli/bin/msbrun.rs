@@ -55,22 +55,35 @@
 //!     -- -m http.server 8080
 //! ```
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("msbrun is only supported on Unix platforms");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 use std::env;
 
+#[cfg(unix)]
 use anyhow::Result;
+#[cfg(unix)]
 use clap::Parser;
+#[cfg(unix)]
 use microsandbox_cli::{McrunArgs, McrunSubcommand};
+#[cfg(unix)]
 use microsandbox_core::{
-    config::{EnvPair, PathPair, PortPair},
+    config::{EnvPair, MountSpec, PortPair},
     runtime::MicroVmMonitor,
     vm::{MicroVm, Rootfs},
 };
+#[cfg(unix)]
 use microsandbox_utils::runtime::Supervisor;
 
 //--------------------------------------------------------------------------------------------------
 // Functions: main
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse command line arguments
@@ -125,7 +138,7 @@ async fn main() -> Result<()> {
             tracing::info!("rootfs: {:#?}", rootfs);
 
             // Parse mapped directories
-            let mapped_dir: Vec<PathPair> = mapped_dir
+            let mapped_dir: Vec<MountSpec> = mapped_dir
                 .iter()
                 .map(|s| s.parse())
                 .collect::<Result<_, _>>()?;

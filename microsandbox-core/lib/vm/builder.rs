@@ -6,13 +6,15 @@ use typed_path::Utf8UnixPathBuf;
 
 use crate::{
     MicrosandboxResult,
-    config::{EnvPair, NetworkScope, PathPair, PortPair},
+    config::{EnvPair, MountSpec, NetworkScope, PortPair},
 };
 
 use super::{
     LinuxRlimit,
-    microvm::{LogLevel, MicroVm, MicroVmConfig, Rootfs},
+    microvm::{LogLevel, MicroVmConfig, Rootfs},
 };
+#[cfg(unix)]
+use super::microvm::MicroVm;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -40,7 +42,7 @@ pub struct MicroVmConfigBuilder<R, E> {
     rootfs: R,
     num_vcpus: u8,
     memory_mib: u32,
-    mapped_dirs: Vec<PathPair>,
+    mapped_dirs: Vec<MountSpec>,
     port_map: Vec<PortPair>,
     scope: NetworkScope,
     ip: Option<Ipv4Addr>,
@@ -261,7 +263,7 @@ impl<R, M> MicroVmConfigBuilder<R, M> {
     /// - Guest paths will be created if they don't exist
     /// - Changes in shared directories are immediately visible to both systems
     /// - Useful for development, configuration files, and data sharing
-    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = PathPair>) -> Self {
+    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = MountSpec>) -> Self {
         self.mapped_dirs = mapped_dirs.into_iter().collect();
         self
     }
@@ -734,7 +736,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = PathPair>) -> Self {
+    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = MountSpec>) -> Self {
         self.inner = self.inner.mapped_dirs(mapped_dirs);
         self
     }
@@ -1028,6 +1030,7 @@ impl MicroVmConfigBuilder<Rootfs, Utf8UnixPathBuf> {
     }
 }
 
+#[cfg(unix)]
 impl MicroVmBuilder<Rootfs, Utf8UnixPathBuf> {
     /// Builds the MicroVm.
     ///

@@ -1,9 +1,11 @@
 use std::{
     ffi::{CStr, CString},
     io::ErrorKind,
-    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use anyhow::anyhow;
 use futures::StreamExt;
@@ -16,6 +18,7 @@ use tokio_tar::{Archive, Entry};
 use crate::{MicrosandboxError, MicrosandboxResult, oci::LayerDependencies};
 
 /// Helper function to get full mode with file type bits
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // libc::S_IF* types differ between platforms (u16 on macOS, u32 on Linux)
 fn get_full_mode(entry_type: &tokio_tar::EntryType, permission_bits: u32) -> u32 {
     let file_type_bits = if entry_type.is_file() {
@@ -38,6 +41,7 @@ fn get_full_mode(entry_type: &tokio_tar::EntryType, permission_bits: u32) -> u32
 }
 
 /// Helper function to set xattr with stat information
+#[cfg(unix)]
 fn set_stat_xattr(
     path: &Path,
     xattr_name: &CStr,
@@ -96,6 +100,7 @@ fn set_stat_xattr(
 /// Extracts a layer from the downloaded tar.gz file into an extracted directory.
 /// The extracted directory will be named as <layer-name>.extracted
 /// Custom extraction function that modifies file ownership during extraction
+#[cfg(unix)]
 pub(crate) async fn extract_tar_with_ownership_override<R: AsyncRead + Unpin>(
     archive: &mut Archive<R>,
     extract_dir: &Path,
@@ -219,6 +224,7 @@ pub(crate) async fn extract_tar_with_ownership_override<R: AsyncRead + Unpin>(
 /// * `dst_path` - The path to unpack the tar entry to
 /// * `extract_dir` - The directory to extract the tar entry to
 /// * `parent_layers` - The parent layers to copy ancestor directories from
+#[cfg(unix)]
 async fn unpack<R: AsyncRead + Unpin>(
     mut entry: Entry<Archive<R>>,
     entry_path: &Path,
@@ -281,6 +287,7 @@ async fn unpack<R: AsyncRead + Unpin>(
 ///
 /// * `template_dir` - The template directory to copy permissions and xattrs from
 /// * `dest_dir` - The destination directory to create and copy permissions and xattrs to
+#[cfg(unix)]
 async fn create_and_copy_dir_attr(template_dir: &Path, dest_dir: &Path) -> MicrosandboxResult<()> {
     if dest_dir.exists() {
         tracing::debug!(dest_dir = %dest_dir.display(), "Destination directory already exists");
@@ -311,6 +318,7 @@ async fn create_and_copy_dir_attr(template_dir: &Path, dest_dir: &Path) -> Micro
 }
 
 // Structure to store hard link information
+#[cfg(unix)]
 struct HardLink {
     link_path: PathBuf,
     target_path: PathBuf,
@@ -319,17 +327,20 @@ struct HardLink {
     mode: u32,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct HardLinkVec {
     hard_links: Vec<HardLink>,
 }
 
+#[cfg(unix)]
 impl From<Vec<HardLink>> for HardLinkVec {
     fn from(value: Vec<HardLink>) -> Self {
         Self { hard_links: value }
     }
 }
 
+#[cfg(unix)]
 impl HardLinkVec {
     pub fn push(&mut self, link: HardLink) {
         self.hard_links.push(link);
@@ -418,7 +429,7 @@ impl HardLinkVec {
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::oci::{Image, LayerDependencies, LayerOps, global_cache::GlobalCacheOps};

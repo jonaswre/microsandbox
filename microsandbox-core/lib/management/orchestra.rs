@@ -12,6 +12,7 @@
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
+    backend::VmBackend,
     config::{Microsandbox, START_SCRIPT_NAME},
 };
 
@@ -20,6 +21,7 @@ use console::style;
 #[cfg(feature = "cli")]
 use microsandbox_utils::term;
 use microsandbox_utils::{MICROSANDBOX_ENV_DIR, SANDBOX_DB_FILENAME};
+#[cfg(unix)]
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -244,6 +246,7 @@ pub async fn apply(
     for sandbox in running_sandboxes {
         if !config_sandboxes.contains_key(&sandbox.name) {
             tracing::info!("stopping sandbox: {}", sandbox.name);
+            #[cfg(unix)]
             if let Err(e) = signal::kill(
                 Pid::from_raw(sandbox.supervisor_pid as i32),
                 Signal::SIGTERM,
@@ -436,6 +439,38 @@ pub async fn up(
     Ok(())
 }
 
+/// Starts a single sandbox using the backend-neutral `VmBackend` trait.
+///
+/// This function resolves the sandbox config into a `ResolvedSandboxSpec` and passes
+/// it to the provided backend for execution. Returns the `RuntimeHandle` for the
+/// started sandbox.
+pub async fn start_sandbox_with_backend(
+    sandbox_name: &str,
+    project_dir: Option<&Path>,
+    config_file: Option<&str>,
+    backend: &dyn VmBackend,
+) -> MicrosandboxResult<crate::backend::RuntimeHandle> {
+    let spec = sandbox::resolve_sandbox_spec(
+        sandbox_name,
+        None,   // script_name
+        project_dir,
+        config_file,
+        vec![], // args
+        None,   // exec
+        true,   // use_image_defaults
+    )
+    .await?;
+
+    let handle = backend.start(&spec).await?;
+    tracing::info!(
+        "started sandbox '{}' via backend {:?} (PID: {})",
+        sandbox_name,
+        handle.backend_kind,
+        handle.worker_pid
+    );
+    Ok(handle)
+}
+
 /// Stops specified sandboxes that are both in the configuration and currently running.
 ///
 /// This function ensures that the specified sandboxes are stopped by:
@@ -545,6 +580,7 @@ pub async fn down(
             && config_sandboxes.contains_key(&sandbox.name)
         {
             tracing::info!("stopping sandbox: {}", sandbox.name);
+            #[cfg(unix)]
             if let Err(e) = signal::kill(
                 Pid::from_raw(sandbox.supervisor_pid as i32),
                 Signal::SIGTERM,
@@ -687,6 +723,7 @@ pub async fn status(
                 sandbox_status.rootfs_paths = Some(sandbox.rootfs_paths.clone());
 
                 // Get CPU and memory usage for the microVM process
+                #[cfg(unix)]
                 if let Ok(mut process) = psutil::process::Process::new(sandbox.microvm_pid) {
                     // CPU usage
                     if let Ok(cpu_percent) = process.cpu_percent() {

@@ -14,7 +14,7 @@ use typed_path::Utf8UnixPathBuf;
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
-    config::{EnvPair, PathPair, PortPair, ReferenceOrPath},
+    config::{EnvPair, HostPathBuf, MountSpec, PortPair, ReferenceOrPath},
 };
 
 use super::{MicrosandboxBuilder, SandboxBuilder};
@@ -78,30 +78,20 @@ pub struct Meta {
     #[builder(default, setter(strip_option))]
     pub(crate) repository: Option<String>,
 
-    /// The path to the readme file.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        serialize_with = "serialize_optional_path",
-        deserialize_with = "deserialize_optional_path"
-    )]
+    /// The path to the readme file (host-side path).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     #[builder(default, setter(strip_option))]
-    pub(crate) readme: Option<Utf8UnixPathBuf>,
+    pub(crate) readme: Option<HostPathBuf>,
 
     /// The tags for the configuration.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[builder(default, setter(strip_option))]
     pub(crate) tags: Option<Vec<String>>,
 
-    /// The icon for the configuration.
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        default,
-        serialize_with = "serialize_optional_path",
-        deserialize_with = "deserialize_optional_path"
-    )]
+    /// The icon for the configuration (host-side path).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     #[builder(default, setter(strip_option))]
-    pub(crate) icon: Option<Utf8UnixPathBuf>,
+    pub(crate) icon: Option<HostPathBuf>,
 }
 
 /// Component mapping for imports.
@@ -138,7 +128,7 @@ pub struct Build {
     /// The volumes to mount.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[builder(default)]
-    pub(crate) volumes: Vec<PathPair>,
+    pub(crate) volumes: Vec<MountSpec>,
 
     /// The ports to expose.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -248,7 +238,7 @@ pub struct Sandbox {
 
     /// The volumes to mount.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub(crate) volumes: Vec<PathPair>,
+    pub(crate) volumes: Vec<MountSpec>,
 
     /// The ports to expose.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -620,12 +610,12 @@ mod tests {
         );
         assert_eq!(
             meta.readme.as_ref().unwrap(),
-            &Utf8UnixPathBuf::from("./README.md")
+            &HostPathBuf::from("./README.md")
         );
         assert_eq!(meta.tags.as_ref().unwrap(), &vec!["test", "example"]);
         assert_eq!(
             meta.icon.as_ref().unwrap(),
-            &Utf8UnixPathBuf::from("./icon.png")
+            &HostPathBuf::from("./icon.png")
         );
 
         // Verify sandbox section

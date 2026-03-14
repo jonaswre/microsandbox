@@ -22,8 +22,10 @@ use typed_path::Utf8UnixPathBuf;
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
+    backend::{ExecSpec, ResolvedSandboxSpec, ResourceLimits, RootfsSource},
     config::{
-        EnvPair, Microsandbox, PathPair, PortPair, ReferenceOrPath, START_SCRIPT_NAME, Sandbox,
+        EnvPair, Microsandbox, MountSpec, PortPair, ReferenceOrPath,
+        START_SCRIPT_NAME, Sandbox,
     },
     management::{config, db, menv, rootfs},
     oci::{Image, Reference},
@@ -266,7 +268,7 @@ pub async fn prepare_run(
 
     // Workdir
     if let Some(workdir) = sandbox_config.get_workdir() {
-        command.arg("--workdir-path").arg(workdir);
+        command.arg("--workdir-path").arg(workdir.as_str());
     }
 
     // Env
@@ -281,29 +283,14 @@ pub async fn prepare_run(
 
     // Volumes
     for volume in sandbox_config.get_volumes() {
-        match volume {
-            PathPair::Distinct { host, guest } => {
-                if host.is_absolute() {
-                    // Absolute host path, use as is
-                    command.arg("--mapped-dir").arg(volume.to_string());
-                } else {
-                    // Relative host path, join with project directory
-                    let host_path = canonical_project_dir.join(host.as_str());
-                    let combined_volume = format!("{}:{}", host_path.display(), guest);
-                    command.arg("--mapped-dir").arg(combined_volume);
-                }
-            }
-            PathPair::Same(path) => {
-                if path.is_absolute() {
-                    // Absolute path, use as is
-                    command.arg("--mapped-dir").arg(volume.to_string());
-                } else {
-                    // Relative path, join with project directory
-                    let host_path = canonical_project_dir.join(path.as_str());
-                    let combined_volume = format!("{}:{}", host_path.display(), path);
-                    command.arg("--mapped-dir").arg(combined_volume);
-                }
-            }
+        if volume.host.is_absolute() {
+            // Absolute host path, use as is
+            command.arg("--mapped-dir").arg(volume.to_string());
+        } else {
+            // Relative host path, join with project directory
+            let host_path = canonical_project_dir.join(volume.host.as_path());
+            let combined_volume = format!("{}:{}", host_path.display(), volume.guest);
+            command.arg("--mapped-dir").arg(combined_volume);
         }
     }
 
@@ -345,6 +332,7 @@ pub async fn prepare_run(
         //                                               (Detached)
         //
         // This ensures that the supervisor runs independently, even if the orchestrator exits.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
@@ -376,6 +364,145 @@ pub async fn prepare_run(
     }
 
     Ok((command, detach))
+}
+
+/// Resolves a sandbox configuration into a backend-neutral `ResolvedSandboxSpec`.
+///
+/// This performs the same config loading and rootfs setup as `prepare_run()`, but
+/// produces a `ResolvedSandboxSpec` suitable for passing to a `VmBackend::start()`.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_sandbox_spec(
+    sandbox_name: &str,
+    script_name: Option<&str>,
+    project_dir: Option<&Path>,
+    config_file: Option<&str>,
+    args: Vec<String>,
+    exec: Option<&str>,
+    use_image_defaults: bool,
+) -> MicrosandboxResult<ResolvedSandboxSpec> {
+    // Load the configuration
+    let (config, canonical_project_dir, config_file) =
+        config::load_config(project_dir, config_file).await?;
+
+    let config_path = canonical_project_dir.join(&config_file);
+
+    // Ensure the .menv files exist
+    let menv_path = canonical_project_dir.join(MICROSANDBOX_ENV_DIR);
+    menv::ensure_menv_files(&menv_path).await?;
+
+    // Get the sandbox config
+    let Some(mut sandbox_config) = config.get_sandbox(sandbox_name).cloned() else {
+        return Err(MicrosandboxError::SandboxNotFoundInConfig(
+            sandbox_name.to_string(),
+            config_path,
+        ));
+    };
+
+    // Sandbox database path
+    let sandbox_db_path = menv_path.join(SANDBOX_DB_FILENAME);
+    let sandbox_pool = db::get_or_create_pool(&sandbox_db_path, &db::SANDBOX_DB_MIGRATOR).await?;
+
+    // Get the config last modified timestamp
+    let config_last_modified: DateTime<Utc> = fs::metadata(&config_path).await?.modified()?.into();
+
+    // Setup rootfs
+    let rootfs = match sandbox_config.get_image().clone() {
+        ReferenceOrPath::Path(root_path) => {
+            setup_native_rootfs(
+                &canonical_project_dir.join(root_path),
+                sandbox_name,
+                &sandbox_config,
+                &config_file,
+                &config_last_modified,
+                &sandbox_pool,
+            )
+            .await?
+        }
+        ReferenceOrPath::Reference(ref reference) => {
+            setup_image_rootfs(
+                reference,
+                sandbox_name,
+                &mut sandbox_config,
+                &menv_path,
+                &config_file,
+                &config_last_modified,
+                &sandbox_pool,
+                use_image_defaults,
+            )
+            .await?
+        }
+    };
+
+    // Determine exec path and args
+    let (exec_path, exec_args) =
+        determine_exec_path_and_args(exec, script_name, &sandbox_config, sandbox_name)?;
+
+    // Combine user args with exec args
+    let final_args = if !args.is_empty() {
+        args
+    } else {
+        exec_args
+    };
+
+    // Convert rootfs to RootfsSource
+    let rootfs_source = match rootfs {
+        Rootfs::Native(path) => RootfsSource::Native(path),
+        Rootfs::Overlayfs(paths) => {
+            // The last path is the RW layer, second-to-last is the patch layer
+            let len = paths.len();
+            if len >= 3 {
+                RootfsSource::Overlayfs {
+                    layers: paths[..len - 2].to_vec(),
+                    patch_dir: paths[len - 2].clone(),
+                    rw_dir: paths[len - 1].clone(),
+                }
+            } else {
+                // Fallback: treat all as layers
+                RootfsSource::Overlayfs {
+                    layers: paths,
+                    patch_dir: PathBuf::new(),
+                    rw_dir: PathBuf::new(),
+                }
+            }
+        }
+    };
+
+    // Resolve volume mounts with absolute paths
+    let mounts: Vec<MountSpec> = sandbox_config
+        .get_volumes()
+        .iter()
+        .map(|v| {
+            if v.host.is_absolute() {
+                v.clone()
+            } else {
+                MountSpec::new(
+                    canonical_project_dir.join(v.host.as_path()).into(),
+                    v.guest.clone(),
+                    v.readonly,
+                )
+            }
+        })
+        .collect();
+
+    Ok(ResolvedSandboxSpec {
+        sandbox_key: sandbox_name.to_string(),
+        rootfs_source,
+        mounts,
+        ports: sandbox_config.get_ports().clone(),
+        env: sandbox_config.get_envs().clone(),
+        workdir: sandbox_config.get_workdir().clone(),
+        exec: ExecSpec {
+            path: Utf8UnixPathBuf::from(exec_path),
+            args: final_args,
+        },
+        resources: ResourceLimits {
+            vcpus: sandbox_config.get_cpus().unwrap_or(1),
+            memory_mib: sandbox_config.get_memory().unwrap_or(1024),
+            rlimits: Vec::new(),
+        },
+        scope: *sandbox_config.get_scope(),
+        portal: None,
+    })
 }
 
 /// Creates and runs a temporary sandbox from an OCI image.
@@ -464,7 +591,7 @@ pub async fn run_temp(
     menv::initialize(Some(temp_dir_path.clone())).await?;
 
     // Parse the volume, port, and env strings into their respective types
-    let volumes: Vec<PathPair> = volumes.into_iter().filter_map(|v| v.parse().ok()).collect();
+    let volumes: Vec<MountSpec> = volumes.into_iter().filter_map(|v| v.parse().ok()).collect();
     let ports: Vec<PortPair> = ports.into_iter().filter_map(|p| p.parse().ok()).collect();
     let envs: Vec<EnvPair> = envs.into_iter().filter_map(|e| e.parse().ok()).collect();
 

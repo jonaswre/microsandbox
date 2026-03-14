@@ -1,4 +1,6 @@
-use std::{ffi::CString, net::Ipv4Addr, path::PathBuf, ptr};
+use std::{net::Ipv4Addr, path::PathBuf};
+#[cfg(unix)]
+use std::{ffi::CString, ptr};
 
 use getset::Getters;
 use ipnetwork::Ipv4Network;
@@ -7,11 +9,13 @@ use typed_path::Utf8UnixPathBuf;
 
 use crate::{
     InvalidMicroVMConfigError, MicrosandboxError, MicrosandboxResult,
-    config::{EnvPair, NetworkScope, PathPair, PortPair},
+    config::{EnvPair, MountSpec, NetworkScope, PortPair},
     utils,
 };
 
-use super::{LinuxRlimit, MicroVmBuilder, MicroVmConfigBuilder, ffi};
+use super::{LinuxRlimit, MicroVmBuilder, MicroVmConfigBuilder};
+#[cfg(unix)]
+use super::ffi;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -49,6 +53,7 @@ pub const VIRTIOFS_TAG_PREFIX: &str = "virtiofs";
 /// # Ok(())
 /// # }
 /// ```
+#[cfg(unix)]
 #[derive(Debug, Getters)]
 pub struct MicroVm {
     /// The context ID for the MicroVm configuration.
@@ -128,8 +133,8 @@ pub struct MicroVmConfig {
     pub memory_mib: u32,
 
     /// The directories to mount in the MicroVm using virtio-fs.
-    /// Each PathPair represents a host:guest path mapping.
-    pub mapped_dirs: Vec<PathPair>,
+    /// Each MountSpec represents a host:guest path mapping.
+    pub mapped_dirs: Vec<MountSpec>,
 
     /// The port map to use for the MicroVm.
     pub port_map: Vec<PortPair>,
@@ -190,6 +195,7 @@ pub enum LogLevel {
 // Methods
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 impl MicroVm {
     /// Creates a new MicroVm from the given configuration.
     ///
@@ -350,8 +356,7 @@ impl MicroVm {
             tracing::debug!("adding virtiofs mount for {}", tag.to_string_lossy());
 
             // Canonicalize the host path
-            let host_path_buf = PathBuf::from(dir.get_host().as_str());
-            let canonical_host_path = match host_path_buf.canonicalize() {
+            let canonical_host_path = match dir.host.as_path().canonicalize() {
                 Ok(path) => path,
                 Err(e) => {
                     tracing::error!("failed to canonicalize host path: {}", e);
@@ -492,7 +497,7 @@ impl MicroVmConfig {
     /// ## Returns
     /// - Ok(()) if no paths are subsets of each other
     /// - Err with details about conflicting paths
-    fn validate_guest_paths(mapped_dirs: &[PathPair]) -> MicrosandboxResult<()> {
+    fn validate_guest_paths(mapped_dirs: &[MountSpec]) -> MicrosandboxResult<()> {
         // Early return if we have 0 or 1 paths - no conflicts possible
         if mapped_dirs.len() <= 1 {
             return Ok(());
@@ -590,12 +595,9 @@ impl MicroVmConfig {
 
         // Check all host paths in mapped_dirs exist
         for dir in &self.mapped_dirs {
-            let host_path = PathBuf::from(dir.get_host().as_str());
-            if !host_path.exists() {
+            if !dir.host.as_path().exists() {
                 return Err(MicrosandboxError::InvalidMicroVMConfig(
-                    InvalidMicroVMConfigError::HostPathDoesNotExist(
-                        host_path.to_str().unwrap().into(),
-                    ),
+                    InvalidMicroVMConfigError::HostPathDoesNotExist(dir.host.to_string()),
                 ));
             }
         }
@@ -671,6 +673,7 @@ impl MicroVmConfig {
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 impl Drop for MicroVm {
     fn drop(&mut self) {
         unsafe { ffi::krun_free_ctx(self.ctx_id) };
@@ -839,7 +842,7 @@ mod tests {
     fn test_validate_guest_paths() -> anyhow::Result<()> {
         // Test valid paths (no conflicts)
         let valid_paths = vec![
-            "/app".parse::<PathPair>()?,
+            "/app".parse::<MountSpec>()?,
             "/data".parse()?,
             "/var/log".parse()?,
             "/etc/config".parse()?,

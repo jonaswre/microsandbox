@@ -63,6 +63,10 @@ pub enum MicrosandboxError {
     #[error("invalid path pair: {0}")]
     InvalidPathPair(String),
 
+    /// An error that occurred when an invalid mount spec was used.
+    #[error("invalid mount spec: {0}")]
+    InvalidMountSpec(String),
+
     /// An error that occurred when an invalid port pair was used.
     #[error("invalid port pair: {0}")]
     InvalidPortPair(String),
@@ -173,6 +177,7 @@ pub enum MicrosandboxError {
     StripPrefix(#[from] StripPrefixError),
 
     /// An error that occurred during a nix operation
+    #[cfg(unix)]
     #[error("nix error: {0}")]
     NixError(#[from] nix::Error),
 

@@ -18,11 +18,11 @@ use tokio::{
 };
 use tokio_tar::Archive;
 
+#[cfg(unix)]
+use crate::oci::extraction::extract_tar_with_ownership_override;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
-    oci::{
-        extraction::extract_tar_with_ownership_override, global_cache::GlobalCacheOps, image::Image,
-    },
+    oci::{global_cache::GlobalCacheOps, image::Image},
 };
 
 #[async_trait]
@@ -159,43 +159,54 @@ impl LayerOps for Layer {
         digest = %self.digest(),
     ))]
     async fn extract(&self, parent: LayerDependencies) -> MicrosandboxResult<()> {
-        assert_eq!(self.digest(), parent.digest());
-        let (false, _guard) = self.extracted().await? else {
-            return Ok(());
-        };
+        #[cfg(unix)]
+        {
+            assert_eq!(self.digest(), parent.digest());
+            let (false, _guard) = self.extracted().await? else {
+                return Ok(());
+            };
 
-        let layer_path = self.tar_path();
-        let digest = self.digest().clone();
-        let extract_dir = self.extracted_layer_dir();
-        fs::create_dir_all(&extract_dir).await.map_err(|source| {
-            MicrosandboxError::LayerHandling {
-                layer: digest.to_string(),
-                source,
-            }
-        })?;
+            let layer_path = self.tar_path();
+            let digest = self.digest().clone();
+            let extract_dir = self.extracted_layer_dir();
+            fs::create_dir_all(&extract_dir).await.map_err(|source| {
+                MicrosandboxError::LayerHandling {
+                    layer: digest.to_string(),
+                    source,
+                }
+            })?;
 
-        tracing::info!("Extracting layer");
+            tracing::info!("Extracting layer");
 
-        let file = tokio::fs::File::open(&layer_path).await?;
-        #[cfg(feature = "cli")]
-        let (file, pb) = {
-            use crate::oci::layer::progress::{ProgressReader, build_progress_bar};
+            let file = tokio::fs::File::open(&layer_path).await?;
+            #[cfg(feature = "cli")]
+            let (file, pb) = {
+                use crate::oci::layer::progress::{ProgressReader, build_progress_bar};
 
-            let total_bytes = fs::metadata(&layer_path).await?.len();
-            let bar = build_progress_bar(total_bytes, &digest.digest()[..8]);
-            let bar_clone = bar.clone();
-            (ProgressReader { inner: file, bar }, bar_clone)
-        };
+                let total_bytes = fs::metadata(&layer_path).await?.len();
+                let bar = build_progress_bar(total_bytes, &digest.digest()[..8]);
+                let bar_clone = bar.clone();
+                (ProgressReader { inner: file, bar }, bar_clone)
+            };
 
-        let mut archive = Archive::new(GzipDecoder::new(BufReader::new(file)));
-        extract_tar_with_ownership_override(&mut archive, &extract_dir, parent)
-            .await
-            .map_err(|e| MicrosandboxError::LayerExtraction(format!("{e:?}")))?;
+            let mut archive = Archive::new(GzipDecoder::new(BufReader::new(file)));
+            extract_tar_with_ownership_override(&mut archive, &extract_dir, parent)
+                .await
+                .map_err(|e| MicrosandboxError::LayerExtraction(format!("{e:?}")))?;
 
-        #[cfg(feature = "cli")]
-        pb.finish_and_clear();
+            #[cfg(feature = "cli")]
+            pb.finish_and_clear();
 
-        tracing::info!("Successfully extracted layer");
+            tracing::info!("Successfully extracted layer");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            return Err(MicrosandboxError::LayerExtraction(
+                "Layer extraction with ownership override is not supported on this platform"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 

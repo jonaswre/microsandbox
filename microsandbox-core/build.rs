@@ -1,33 +1,39 @@
-use std::{env, path::Path};
+use std::env;
 
 fn main() {
-    // Get the manifest directory (where Cargo.toml lives)
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let build_dir = Path::new(&manifest_dir).parent().unwrap().join("build");
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    // Add build directory as first search path
-    println!("cargo:rustc-link-search=native={}", build_dir.display());
+    // Only link against libkrun on Unix platforms
+    if target_os != "windows" {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let build_dir = std::path::Path::new(&manifest_dir)
+            .parent()
+            .unwrap()
+            .join("build");
 
-    // Add system paths as fallback
-    println!("cargo:rustc-link-search=native=/usr/local/lib");
+        // Add build directory as first search path
+        println!("cargo:rustc-link-search=native={}", build_dir.display());
 
-    // Add user-specific library as fallback
-    println!(
-        "cargo:rustc-link-search=native={}/.local/lib",
-        env::var("HOME").unwrap()
-    );
+        // Add system paths as fallback
+        println!("cargo:rustc-link-search=native=/usr/local/lib");
 
-    // Link against libkrun library
-    println!("cargo:rustc-link-lib=dylib=krun");
+        // Add user-specific library as fallback
+        if let Ok(home) = env::var("HOME") {
+            println!("cargo:rustc-link-search=native={}/.local/lib", home);
+        }
 
-    // Force rebuild if the library changes
-    println!(
-        "cargo:rerun-if-changed={}",
-        build_dir.join("libkrun.dylib").display()
-    );
+        // Link against libkrun library
+        println!("cargo:rustc-link-lib=dylib=krun");
 
-    println!(
-        "cargo:rerun-if-changed={}",
-        build_dir.join("libkrun.so").display()
-    );
+        // Force rebuild if the library changes
+        println!(
+            "cargo:rerun-if-changed={}",
+            build_dir.join("libkrun.dylib").display()
+        );
+
+        println!(
+            "cargo:rerun-if-changed={}",
+            build_dir.join("libkrun.so").display()
+        );
+    }
 }

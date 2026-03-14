@@ -15,7 +15,7 @@
 
 use std::{fs, path::PathBuf, sync::LazyLock};
 
-use crate::MICROSANDBOX_HOME_DIR;
+use crate::platform::platform_paths;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -31,8 +31,9 @@ pub const DEFAULT_NUM_VCPUS: u8 = 1;
 pub const DEFAULT_MEMORY_MIB: u32 = 1024;
 
 /// The path where all microsandbox global data is stored.
+/// Uses platform-aware resolution via `PlatformPaths`.
 pub static DEFAULT_MICROSANDBOX_HOME: LazyLock<PathBuf> =
-    LazyLock::new(|| dirs::home_dir().unwrap().join(MICROSANDBOX_HOME_DIR));
+    LazyLock::new(|| platform_paths().data_home());
 
 /// The default OCI registry domain.
 pub const DEFAULT_OCI_REGISTRY: &str = "docker.io";

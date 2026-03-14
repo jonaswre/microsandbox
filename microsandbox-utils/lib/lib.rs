@@ -8,6 +8,7 @@ pub mod env;
 pub mod error;
 pub mod log;
 pub mod path;
+pub mod platform;
 pub mod runtime;
 pub mod seekable;
 pub mod term;

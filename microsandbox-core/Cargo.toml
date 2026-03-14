@@ -31,23 +31,13 @@ getset.workspace = true
 hex.workspace = true
 indicatif = { workspace = true, optional = true }
 ipnetwork.workspace = true
-libc.workspace = true
 microsandbox-utils.workspace = true
-nix = { workspace = true, features = [
-    "fs",
-    "mount",
-    "process",
-    "signal",
-    "term",
-    "user",
-] }
 nondestructive.workspace = true
 oci-client = { workspace = true }
 oci-spec.workspace = true
 once_cell.workspace = true
 pin-project-lite.workspace = true
 pretty-error-debug.workspace = true
-psutil.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 reqwest-middleware.workspace = true
@@ -69,6 +59,18 @@ typed-builder.workspace = true
 typed-path.workspace = true
 walkdir.workspace = true
 which.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix = { workspace = true, features = [
+    "fs",
+    "mount",
+    "process",
+    "signal",
+    "term",
+    "user",
+] }
+psutil.workspace = true
 xattr.workspace = true
 
 [dev-dependencies]

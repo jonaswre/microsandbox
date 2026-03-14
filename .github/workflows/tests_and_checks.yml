@@ -152,12 +152,22 @@ jobs:
         with:
           command: check bans licenses sources
 
-      - name: Check Release Build
+      - name: Build Release
         run: |
           export LIBRARY_PATH=${{ github.workspace }}/build:${{ github.workspace }}/build/libkrunfw:${{ github.workspace }}/build/libkrun/target/release
           export LD_LIBRARY_PATH=${{ github.workspace }}/build:${{ github.workspace }}/build/libkrunfw:${{ github.workspace }}/build/libkrun/target/release
           cargo check --all-features
           cargo build --release
+
+      - name: Upload Release Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-binaries
+          path: |
+            target/release/msb
+            target/release/msbrun
+            target/release/msbserver
+          retention-days: 1
 
   run-tests:
     needs: [check-libkrun-cache-changes, build-libkrun]
@@ -190,3 +200,84 @@ jobs:
           export LD_LIBRARY_PATH=${{ github.workspace }}/build:${{ github.workspace }}/build/libkrunfw:${{ github.workspace }}/build/libkrun/target/release
           export RUSTDOCFLAGS="-C link-args=-Wl,-rpath,${{ github.workspace }}/build,-rpath,${{ github.workspace }}/build/libkrunfw,-rpath,${{ github.workspace }}/build/libkrun/target/release"
           cargo test --workspace -- --include-ignored
+
+  linux-e2e:
+    needs: [check-libkrun-cache-changes, run-checks]
+    if: always() && needs.run-checks.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Restore libkrun cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/libkrunfw/libkrunfw*.so*
+            build/libkrun/target/release/libkrun*.so*
+            build/libkrunfw.so*
+            build/libkrun.so*
+          key: ${{ runner.os }}-libkrun-${{ needs.check-libkrun-cache-changes.outputs.libkrun_hash }}
+
+      - name: Download Release Binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-release-binaries
+          path: bin/
+
+      - name: Set Up Binaries and Libraries
+        run: |
+          chmod +x bin/msb bin/msbrun bin/msbserver
+          echo "${{ github.workspace }}/bin" >> $GITHUB_PATH
+          LIB_PATH="${{ github.workspace }}/build:${{ github.workspace }}/build/libkrunfw:${{ github.workspace }}/build/libkrun/target/release"
+          echo "LD_LIBRARY_PATH=$LIB_PATH" >> $GITHUB_ENV
+          echo "MSBRUN_EXE=${{ github.workspace }}/bin/msbrun" >> $GITHUB_ENV
+          echo "MSBSERVER_EXE=${{ github.workspace }}/bin/msbserver" >> $GITHUB_ENV
+
+      - name: Verify KVM Access
+        run: |
+          ls -la /dev/kvm
+          [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo "KVM is accessible" || { echo "KVM not accessible"; exit 1; }
+
+      - name: Run E2E Smoke Tests
+        run: bash scripts/ci/e2e_smoke_test.sh
+
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Cache Project
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          override: true
+          toolchain: stable
+
+      - name: Compile Check
+        run: cargo check --workspace
+
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Cache Project
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          override: true
+          toolchain: stable
+
+      - name: Run Platform-Independent Tests
+        run: cargo test -p microsandbox-core --lib -- config::mount_spec config::reference_path config::path_pair config::path_segment backend::windows::rootfs backend::windows::hcs backend::windows::networking backend::windows::supervisor backend::windows::boot_bundle
+
+      - name: Run Utils Platform Tests
+        run: cargo test -p microsandbox-utils --lib -- platform

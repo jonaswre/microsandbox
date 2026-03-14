@@ -35,23 +35,25 @@ pub static ERROR_TICK_STRINGS: LazyLock<[&str; 2]> = LazyLock::new(|| ["⠏", &E
 
 /// Determines if the process is running in an interactive terminal environment
 pub fn is_interactive_terminal() -> bool {
-    // Check if stdin and stdout are TTYs
-    let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-    let stdout_is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
+    #[cfg(unix)]
+    {
+        let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+        let stdout_is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
+        let is_tty = stdin_is_tty && stdout_is_tty;
 
-    // Base check: both stdin and stdout must be TTYs
-    let is_tty = stdin_is_tty && stdout_is_tty;
+        if is_tty && std::env::var("TERM").is_err() {
+            tracing::debug!("detected TTY without TERM environment variable");
+        }
 
-    // Optional enhancement: check for TERM, but don't require it
-    let has_term = std::env::var("TERM").is_ok();
-
-    // Log the detection for debugging
-    if is_tty && !has_term {
-        tracing::debug!("detected TTY without TERM environment variable");
+        is_tty
     }
 
-    // Return true if we have TTYs, regardless of TERM
-    is_tty
+    #[cfg(windows)]
+    {
+        // On Windows, use std::io::IsTerminal (Rust 1.70+)
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
 }
 
 /// Determines if the process is running in an ANSI terminal environment
