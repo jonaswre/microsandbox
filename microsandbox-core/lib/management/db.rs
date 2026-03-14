@@ -13,7 +13,11 @@ use oci_client::{
     manifest::{OciDescriptor, OciImageManifest},
 };
 use oci_spec::image::MediaType;
-use sqlx::{Pool, Row, Sqlite, migrate::Migrator, sqlite::SqlitePoolOptions};
+use sqlx::{
+    ConnectOptions, Pool, Row, Sqlite,
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use tokio::fs;
 
 use crate::{
@@ -25,13 +29,15 @@ use crate::{
 /// Duplicated here to avoid depending on the unix-gated `runtime` module.
 const SANDBOX_STATUS_RUNNING: &str = "RUNNING";
 
-/// Constructs a SQLite connection URL from a filesystem path.
+/// Creates SQLite connect options for a database path.
 ///
-/// Normalizes Windows backslashes to forward slashes and uses the `sqlite:`
-/// URI scheme with `?mode=rwc` to create the database if it doesn't exist.
-fn sqlite_url(path: &Path) -> String {
-    let path_str = path.display().to_string().replace('\\', "/");
-    format!("sqlite:///{}?mode=rwc", path_str)
+/// Uses `SqliteConnectOptions` directly instead of URL parsing to avoid
+/// issues with Windows drive letters (e.g. `C:`) being misinterpreted
+/// as URL components.
+fn sqlite_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -73,7 +79,7 @@ pub async fn initialize(
     // Create database connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&sqlite_url(db_path))
+        .connect_with(sqlite_options(db_path))
         .await?;
 
     // Run migrations
@@ -91,7 +97,7 @@ pub async fn get_pool(db_path: impl AsRef<Path>) -> MicrosandboxResult<Pool<Sqli
     let db_path = db_path.as_ref();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&sqlite_url(db_path))
+        .connect_with(sqlite_options(db_path))
         .await?;
 
     Ok(pool)
