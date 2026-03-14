@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     backend::{
-        BackendKind, ResolvedSandboxSpec, RuntimeHandle, RuntimeStatus, VmBackend,
+        BackendKind, ResolvedSandboxSpec, RootfsMaterializer, RuntimeHandle, RuntimeStatus,
+        VmBackend,
         windows::rootfs::{WindowsMaterializedRootfs, WindowsRootfsMaterializer},
     },
 };

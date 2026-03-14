@@ -2,6 +2,7 @@ use std::{net::Ipv4Addr, path::PathBuf};
 #[cfg(unix)]
 use std::{ffi::CString, ptr};
 
+#[cfg(unix)]
 use getset::Getters;
 use ipnetwork::Ipv4Network;
 use microsandbox_utils::SupportedPathType;
@@ -13,7 +14,9 @@ use crate::{
     utils,
 };
 
-use super::{LinuxRlimit, MicroVmBuilder, MicroVmConfigBuilder};
+use super::LinuxRlimit;
+#[cfg(unix)]
+use super::{MicroVmBuilder, MicroVmConfigBuilder};
 #[cfg(unix)]
 use super::ffi;
 

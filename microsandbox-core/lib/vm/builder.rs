@@ -4,10 +4,9 @@ use ipnetwork::Ipv4Network;
 use microsandbox_utils::{DEFAULT_MEMORY_MIB, DEFAULT_NUM_VCPUS};
 use typed_path::Utf8UnixPathBuf;
 
-use crate::{
-    MicrosandboxResult,
-    config::{EnvPair, MountSpec, NetworkScope, PortPair},
-};
+use crate::config::{EnvPair, MountSpec, NetworkScope, PortPair};
+#[cfg(unix)]
+use crate::MicrosandboxResult;
 
 use super::{
     LinuxRlimit,

@@ -207,6 +207,8 @@ impl LayerOps for Layer {
                     .to_string(),
             ));
         }
+
+        #[cfg(unix)]
         Ok(())
     }
 
