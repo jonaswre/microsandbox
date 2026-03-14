@@ -119,7 +119,7 @@ fi
 
 # --- Test 5: Environment variables ---
 step "Test 5: Environment variable injection"
-if OUTPUT=$("$MSB" exe "$TEST_IMAGE" --env "E2E_VAR=smoke_test_42" -e "echo \$E2E_VAR" 2>&1); then
+if OUTPUT=$("$MSB" exe "$TEST_IMAGE" --env "E2E_VAR=smoke_test_42" -e 'echo $E2E_VAR' 2>&1); then
     if echo "$OUTPUT" | grep -qF "smoke_test_42"; then
         pass "Test 5: Env var injection works"
     else
