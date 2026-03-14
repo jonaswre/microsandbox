@@ -245,8 +245,9 @@ jobs:
       - name: Run E2E Smoke Tests
         run: bash scripts/ci/e2e_smoke_test.sh
 
-  windows-check:
+  windows-e2e:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -263,8 +264,25 @@ jobs:
       - name: Compile Check
         run: cargo check --workspace
 
-  windows-tests:
-    runs-on: windows-latest
+      - name: Run Platform-Independent Tests
+        run: cargo test -p microsandbox-core --lib -- config::mount_spec config::reference_path config::path_pair config::path_segment backend::windows::rootfs backend::windows::hcs backend::windows::networking backend::windows::supervisor backend::windows::boot_bundle
+
+      - name: Run Utils Platform Tests
+        run: cargo test -p microsandbox-utils --lib -- platform
+
+      - name: Build Release
+        run: cargo build --release
+
+      - name: Run Windows Smoke Tests
+        run: |
+          $env:MSB_BIN = "${{ github.workspace }}\target\release\msb.exe"
+          $env:MSBRUN_EXE = "${{ github.workspace }}\target\release\msbrun.exe"
+          $env:MSBSERVER_EXE = "${{ github.workspace }}\target\release\msbserver.exe"
+          powershell -ExecutionPolicy Bypass -File scripts\ci\windows_smoke_test.ps1
+
+  macos-e2e:
+    runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -278,8 +296,55 @@ jobs:
           override: true
           toolchain: stable
 
-      - name: Run Platform-Independent Tests
-        run: cargo test -p microsandbox-core --lib -- config::mount_spec config::reference_path config::path_pair config::path_segment backend::windows::rootfs backend::windows::hcs backend::windows::networking backend::windows::supervisor backend::windows::boot_bundle
+      - name: Compile Check
+        run: cargo check --workspace
 
-      - name: Run Utils Platform Tests
-        run: cargo test -p microsandbox-utils --lib -- platform
+      - name: Run Utils Tests
+        run: cargo test -p microsandbox-utils
+
+      - name: Create Stub libkrun for Linking
+        run: |
+          mkdir -p build
+          cat > /tmp/libkrun_stub.c << 'STUBEOF'
+          int krun_set_log_level(int l) { return 0; }
+          int krun_create_ctx() { return 0; }
+          int krun_free_ctx(int c) { return 0; }
+          int krun_set_vm_config(int c, int v, int r) { return 0; }
+          int krun_set_root(int c, const char *r) { return 0; }
+          int krun_set_overlayfs_root(int c, const char *r) { return 0; }
+          int krun_add_disk(int c, const char *p) { return 0; }
+          int krun_add_virtiofs(int c, const char *t, const char *p) { return 0; }
+          int krun_add_virtiofs2(int c, const char *t, const char *p) { return 0; }
+          int krun_set_passt_fd(int c, int f) { return 0; }
+          int krun_set_gvproxy_path(int c, const char *p) { return 0; }
+          int krun_set_net_mac(int c, const char *m) { return 0; }
+          int krun_set_port_map(int c, const char *m) { return 0; }
+          int krun_set_tsi_scope(int c, int s) { return 0; }
+          int krun_set_gpu_options(int c, int o) { return 0; }
+          int krun_set_gpu_options2(int c, int a, int b) { return 0; }
+          int krun_set_snd_device(int c, int d) { return 0; }
+          int krun_set_rlimits(int c, const char *r) { return 0; }
+          int krun_set_smbios_oem_strings(int c, const char *s) { return 0; }
+          int krun_set_workdir(int c, const char *w) { return 0; }
+          int krun_set_exec(int c, const char *e, const char *a) { return 0; }
+          int krun_set_env(int c, const char *e) { return 0; }
+          int krun_set_tee_config_file(int c, const char *p) { return 0; }
+          int krun_add_vsock_port(int c, int p) { return 0; }
+          int krun_get_shutdown_eventfd(int c) { return 0; }
+          int krun_set_console_output(int c, int o) { return 0; }
+          int krun_start_enter(int c) { return 0; }
+          STUBEOF
+          cc -shared -o build/libkrun.dylib /tmp/libkrun_stub.c
+
+      - name: Build Release
+        run: |
+          export LIBRARY_PATH=${{ github.workspace }}/build
+          cargo build --release
+
+      - name: Run macOS Smoke Tests
+        run: |
+          export DYLD_LIBRARY_PATH=${{ github.workspace }}/build
+          export MSB_BIN=${{ github.workspace }}/target/release/msb
+          export MSBRUN_EXE=${{ github.workspace }}/target/release/msbrun
+          export MSBSERVER_EXE=${{ github.workspace }}/target/release/msbserver
+          bash scripts/ci/macos_smoke_test.sh
