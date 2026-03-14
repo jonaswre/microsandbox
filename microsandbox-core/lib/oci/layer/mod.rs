@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(unix)]
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 
@@ -13,9 +14,11 @@ use microsandbox_utils::EXTRACTED_LAYER_SUFFIX;
 use oci_spec::image::Digest;
 use tokio::{
     fs,
-    io::BufReader,
     sync::{Mutex, OwnedMutexGuard},
 };
+#[cfg(unix)]
+use tokio::io::BufReader;
+#[cfg(unix)]
 use tokio_tar::Archive;
 
 #[cfg(unix)]

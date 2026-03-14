@@ -14,9 +14,9 @@ use crate::{
     utils,
 };
 
-use super::LinuxRlimit;
+use super::{LinuxRlimit, MicroVmConfigBuilder};
 #[cfg(unix)]
-use super::{MicroVmBuilder, MicroVmConfigBuilder};
+use super::MicroVmBuilder;
 #[cfg(unix)]
 use super::ffi;
 

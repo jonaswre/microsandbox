@@ -22,6 +22,7 @@ pub use env::*;
 pub use error::*;
 pub use log::*;
 pub use path::*;
+#[cfg(unix)]
 pub use runtime::*;
 pub use seekable::*;
 pub use term::*;

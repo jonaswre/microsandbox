@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::{
     ffi::{CStr, CString},
     io::ErrorKind,
@@ -7,14 +8,19 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
 use anyhow::anyhow;
+#[cfg(unix)]
 use futures::StreamExt;
+#[cfg(unix)]
 use tokio::{
     fs::{self, DirBuilder},
     io::AsyncRead,
 };
+#[cfg(unix)]
 use tokio_tar::{Archive, Entry};
 
+#[cfg(unix)]
 use crate::{MicrosandboxError, MicrosandboxResult, oci::LayerDependencies};
 
 /// Helper function to get full mode with file type bits
