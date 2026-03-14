@@ -64,7 +64,10 @@ pub async fn initialize(
     // Create database connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite://{}?mode=rwc", db_path.display().to_string().replace('\\', "/")))
+        .connect(&format!(
+            "sqlite://{}?mode=rwc",
+            db_path.display().to_string().replace('\\', "/")
+        ))
         .await?;
 
     // Run migrations
@@ -82,7 +85,10 @@ pub async fn get_pool(db_path: impl AsRef<Path>) -> MicrosandboxResult<Pool<Sqli
     let db_path = db_path.as_ref();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite://{}?mode=rwc", db_path.display().to_string().replace('\\', "/")))
+        .connect(&format!(
+            "sqlite://{}?mode=rwc",
+            db_path.display().to_string().replace('\\', "/")
+        ))
         .await?;
 
     Ok(pool)
