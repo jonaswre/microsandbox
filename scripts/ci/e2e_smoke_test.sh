@@ -38,8 +38,12 @@ if [ ! -e /dev/kvm ]; then
     exit 1
 fi
 if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-    error "/dev/kvm is not accessible (check permissions)"
-    exit 1
+    step "KVM not accessible, attempting chmod..."
+    sudo chmod 666 /dev/kvm 2>/dev/null || true
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        error "/dev/kvm is not accessible (check permissions)"
+        exit 1
+    fi
 fi
 step "KVM is available"
 
