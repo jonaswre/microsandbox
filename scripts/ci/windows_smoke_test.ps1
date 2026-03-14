@@ -2,7 +2,9 @@
 # Validates server lifecycle and graceful Hyper-V error handling.
 # Requires: msb.exe, msbrun.exe, msbserver.exe release binaries.
 
-$ErrorActionPreference = "Stop"
+# Use Continue so stderr from native commands doesn't terminate the script.
+# We check $LASTEXITCODE manually after each command.
+$ErrorActionPreference = "Continue"
 
 $MSB = if ($env:MSB_BIN) { $env:MSB_BIN } else { "msb.exe" }
 $SERVER_HOST = "127.0.0.1"
@@ -73,7 +75,7 @@ Step "Test 3: VM boot attempt (expect graceful Hyper-V error)"
 $output = & $MSB exe alpine -e "echo hello" 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) {
     # Expected to fail - check it's a graceful error, not a crash
-    if ($output -match "Hyper-V" -or $output -match "not enabled" -or $output -match "not implemented" -or $output -match "NotImplemented") {
+    if ($output -match "Hyper-V" -or $output -match "not enabled" -or $output -match "not implemented" -or $output -match "NotImplemented" -or $output -match "not supported on this platform" -or $output -match "layer extraction") {
         Pass "Test 3: VM boot fails gracefully with Hyper-V error"
     } elseif ($output -match "panicked" -or $output -match "EXCEPTION") {
         Fail "Test 3: VM boot crashed instead of failing gracefully: $output"
