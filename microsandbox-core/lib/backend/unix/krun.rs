@@ -3,8 +3,7 @@
 //! Wraps the existing sandbox lifecycle (spawning msbrun supervisor) behind the
 //! `VmBackend` trait. The msbrun process handles the actual libkrun FFI calls.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::{path::PathBuf, process::Stdio};
 
 use async_trait::async_trait;
 use tokio::process::Command;

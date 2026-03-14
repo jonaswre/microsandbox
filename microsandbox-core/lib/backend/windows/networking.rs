@@ -164,10 +164,7 @@ $network.Id
     }
 
     /// Creates an HCN endpoint for a sandbox, attached to the NAT network.
-    pub async fn create_endpoint(
-        &self,
-        sandbox_key: &str,
-    ) -> MicrosandboxResult<HcnEndpoint> {
+    pub async fn create_endpoint(&self, sandbox_key: &str) -> MicrosandboxResult<HcnEndpoint> {
         let network = self.nat_network.as_ref().ok_or_else(|| {
             MicrosandboxError::NotImplemented(
                 "NAT network not initialized. Call ensure_nat_network() first.".to_string(),
@@ -187,10 +184,7 @@ $endpoint = New-HnsEndpoint -NetworkId '{}' -Name 'msb-{}'
             .output()
             .await
             .map_err(|e| {
-                MicrosandboxError::NotImplemented(format!(
-                    "Failed to create HCN endpoint: {}",
-                    e
-                ))
+                MicrosandboxError::NotImplemented(format!("Failed to create HCN endpoint: {}", e))
             })?;
 
         if !output.status.success() {
@@ -211,10 +205,7 @@ $endpoint = New-HnsEndpoint -NetworkId '{}' -Name 'msb-{}'
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result: EndpointResult = serde_json::from_str(&stdout).map_err(|e| {
-            MicrosandboxError::NotImplemented(format!(
-                "Failed to parse endpoint result: {}",
-                e
-            ))
+            MicrosandboxError::NotImplemented(format!("Failed to parse endpoint result: {}", e))
         })?;
 
         let endpoint = HcnEndpoint {
@@ -298,10 +289,7 @@ $lb.Id
             .output()
             .await
             .map_err(|e| {
-                MicrosandboxError::NotImplemented(format!(
-                    "Failed to delete HCN endpoint: {}",
-                    e
-                ))
+                MicrosandboxError::NotImplemented(format!("Failed to delete HCN endpoint: {}", e))
             })?;
 
         if !output.status.success() {

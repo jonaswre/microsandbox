@@ -12,12 +12,12 @@ use async_trait::async_trait;
 
 use microsandbox_utils::EXTRACTED_LAYER_SUFFIX;
 use oci_spec::image::Digest;
+#[cfg(unix)]
+use tokio::io::BufReader;
 use tokio::{
     fs,
     sync::{Mutex, OwnedMutexGuard},
 };
-#[cfg(unix)]
-use tokio::io::BufReader;
 #[cfg(unix)]
 use tokio_tar::Archive;
 

@@ -276,10 +276,7 @@ impl VmBackend for WindowsHcsBackend {
         let rootfs_config = super::rootfs::WindowsRootfsConfig {
             cache_dir: self.config.cache_dir.clone(),
             runtime_dir: self.config.runtime_dir.clone(),
-            tar2ext4_path: self
-                .config
-                .boot_bundle_dir
-                .join("tar2ext4.exe"),
+            tar2ext4_path: self.config.boot_bundle_dir.join("tar2ext4.exe"),
         };
         let materializer = WindowsRootfsMaterializer::new(rootfs_config);
         let rootfs = materializer.materialize(spec).await?;

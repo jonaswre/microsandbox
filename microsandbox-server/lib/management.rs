@@ -263,25 +263,21 @@ pub async fn start(
     // Wait for child process to exit or signal to be received
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(
-                |e| {
-                    MicrosandboxServerError::StartError(format!(
-                        "failed to set up signal handlers: {}",
-                        e
-                    ))
-                },
-            )?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| {
+                MicrosandboxServerError::StartError(format!(
+                    "failed to set up signal handlers: {}",
+                    e
+                ))
+            })?;
 
-        let mut sigint =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map_err(
-                |e| {
-                    MicrosandboxServerError::StartError(format!(
-                        "failed to set up signal handlers: {}",
-                        e
-                    ))
-                },
-            )?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| {
+                MicrosandboxServerError::StartError(format!(
+                    "failed to set up signal handlers: {}",
+                    e
+                ))
+            })?;
 
         tokio::select! {
             status = child.wait() => {

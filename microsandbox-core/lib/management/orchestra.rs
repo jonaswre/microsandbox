@@ -452,7 +452,7 @@ pub async fn start_sandbox_with_backend(
 ) -> MicrosandboxResult<crate::backend::RuntimeHandle> {
     let spec = sandbox::resolve_sandbox_spec(
         sandbox_name,
-        None,   // script_name
+        None, // script_name
         project_dir,
         config_file,
         vec![], // args

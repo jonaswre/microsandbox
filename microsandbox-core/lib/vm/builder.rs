@@ -4,16 +4,16 @@ use ipnetwork::Ipv4Network;
 use microsandbox_utils::{DEFAULT_MEMORY_MIB, DEFAULT_NUM_VCPUS};
 use typed_path::Utf8UnixPathBuf;
 
-use crate::config::{EnvPair, MountSpec, NetworkScope, PortPair};
 #[cfg(unix)]
 use crate::MicrosandboxResult;
+use crate::config::{EnvPair, MountSpec, NetworkScope, PortPair};
 
+#[cfg(unix)]
+use super::microvm::MicroVm;
 use super::{
     LinuxRlimit,
     microvm::{LogLevel, MicroVmConfig, Rootfs},
 };
-#[cfg(unix)]
-use super::microvm::MicroVm;
 
 //--------------------------------------------------------------------------------------------------
 // Types

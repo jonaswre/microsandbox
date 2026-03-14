@@ -329,9 +329,7 @@ impl<'de> Deserialize<'de> for MountSpec {
                     readonly,
                 })
             }
-            MountSpecRepr::LegacyString(s) => {
-                MountSpec::from_str(&s).map_err(de::Error::custom)
-            }
+            MountSpecRepr::LegacyString(s) => MountSpec::from_str(&s).map_err(de::Error::custom),
         }
     }
 }
@@ -350,6 +348,7 @@ mod tests {
     fn test_host_path_buf_from_pathbuf() {
         let host = HostPathBuf::from(PathBuf::from("/home/user/project"));
         assert_eq!(host.to_string(), "/home/user/project");
+        #[cfg(unix)]
         assert!(host.is_absolute());
     }
 
@@ -400,6 +399,7 @@ mod tests {
 
     // -- MountSpec tests --
 
+    #[cfg(unix)]
     #[test]
     fn test_mount_spec_from_str_distinct() {
         let mount: MountSpec = "/host/data:/container/data".parse().unwrap();
@@ -415,6 +415,7 @@ mod tests {
         assert_eq!(mount.guest.as_str(), "/data");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_mount_spec_from_str_same_explicit() {
         let mount: MountSpec = "/data:/data".parse().unwrap();
@@ -468,6 +469,7 @@ mod tests {
         assert!(mount.readonly);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_mount_spec_deserialize_legacy_string() {
         let yaml = r#""/host/path:/guest/path""#;
@@ -508,10 +510,8 @@ mod tests {
 
     #[test]
     fn test_mount_spec_serialize_omits_readonly_false() {
-        let mount = MountSpec::with_distinct(
-            HostPathBuf::from("/data"),
-            GuestPathBuf::from("/mnt/data"),
-        );
+        let mount =
+            MountSpec::with_distinct(HostPathBuf::from("/data"), GuestPathBuf::from("/mnt/data"));
         let yaml = serde_yaml::to_string(&mount).unwrap();
         assert!(!yaml.contains("readonly"));
     }
@@ -526,14 +526,13 @@ mod tests {
 
     #[test]
     fn test_mount_spec_getters() {
-        let mount = MountSpec::with_distinct(
-            HostPathBuf::from("/host"),
-            GuestPathBuf::from("/guest"),
-        );
+        let mount =
+            MountSpec::with_distinct(HostPathBuf::from("/host"), GuestPathBuf::from("/guest"));
         assert_eq!(mount.get_host().to_string(), "/host");
         assert_eq!(mount.get_guest().as_str(), "/guest");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_mount_spec_in_list_mixed_formats() {
         let yaml = r#"

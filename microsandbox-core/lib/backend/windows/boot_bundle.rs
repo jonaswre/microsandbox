@@ -106,10 +106,7 @@ pub fn bundle_dir(runtime_dir: &Path, version: &str) -> PathBuf {
 /// Loads and validates a boot bundle from disk.
 ///
 /// Verifies that all required files exist and the manifest is valid.
-pub async fn load_bundle(
-    runtime_dir: &Path,
-    version: &str,
-) -> MicrosandboxResult<BootBundle> {
+pub async fn load_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResult<BootBundle> {
     let dir = bundle_dir(runtime_dir, version);
 
     if !dir.exists() {
@@ -158,22 +155,16 @@ pub fn check_compatibility(
     bundle: &BootBundleManifest,
     host_version: &str,
 ) -> MicrosandboxResult<()> {
-    let bundle_min: semver::Version = bundle
-        .min_host_version
-        .parse()
-        .map_err(|e| {
-            MicrosandboxError::ConfigValidation(format!(
-                "Invalid min_host_version in boot bundle: {}",
-                e
-            ))
-        })?;
-
-    let host: semver::Version = host_version.parse().map_err(|e| {
+    let bundle_min: semver::Version = bundle.min_host_version.parse().map_err(|e| {
         MicrosandboxError::ConfigValidation(format!(
-            "Invalid host version: {}",
+            "Invalid min_host_version in boot bundle: {}",
             e
         ))
     })?;
+
+    let host: semver::Version = host_version
+        .parse()
+        .map_err(|e| MicrosandboxError::ConfigValidation(format!("Invalid host version: {}", e)))?;
 
     if host < bundle_min {
         return Err(MicrosandboxError::ConfigValidation(format!(

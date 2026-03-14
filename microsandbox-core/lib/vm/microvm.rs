@@ -1,6 +1,6 @@
-use std::{net::Ipv4Addr, path::PathBuf};
 #[cfg(unix)]
 use std::{ffi::CString, ptr};
+use std::{net::Ipv4Addr, path::PathBuf};
 
 #[cfg(unix)]
 use getset::Getters;
@@ -14,11 +14,11 @@ use crate::{
     utils,
 };
 
-use super::{LinuxRlimit, MicroVmConfigBuilder};
 #[cfg(unix)]
 use super::MicroVmBuilder;
 #[cfg(unix)]
 use super::ffi;
+use super::{LinuxRlimit, MicroVmConfigBuilder};
 
 //--------------------------------------------------------------------------------------------------
 // Constants

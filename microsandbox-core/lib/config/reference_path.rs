@@ -368,10 +368,7 @@ mod tests {
 
     #[test]
     fn test_unc_path() {
-        let cases = vec![
-            r"\\server\share\rootfs",
-            r"\\192.168.1.1\data\rootfs",
-        ];
+        let cases = vec![r"\\server\share\rootfs", r"\\192.168.1.1\data\rootfs"];
 
         for case in cases {
             let reference = ReferenceOrPath::from_str(case).unwrap();

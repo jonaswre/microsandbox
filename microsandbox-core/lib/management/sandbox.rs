@@ -24,8 +24,7 @@ use crate::{
     MicrosandboxError, MicrosandboxResult,
     backend::{ExecSpec, ResolvedSandboxSpec, ResourceLimits, RootfsSource},
     config::{
-        EnvPair, Microsandbox, MountSpec, PortPair, ReferenceOrPath,
-        START_SCRIPT_NAME, Sandbox,
+        EnvPair, Microsandbox, MountSpec, PortPair, ReferenceOrPath, START_SCRIPT_NAME, Sandbox,
     },
     management::{config, db, menv, rootfs},
     oci::{Image, Reference},
@@ -438,11 +437,7 @@ pub async fn resolve_sandbox_spec(
         determine_exec_path_and_args(exec, script_name, &sandbox_config, sandbox_name)?;
 
     // Combine user args with exec args
-    let final_args = if !args.is_empty() {
-        args
-    } else {
-        exec_args
-    };
+    let final_args = if !args.is_empty() { args } else { exec_args };
 
     // Convert rootfs to RootfsSource
     let rootfs_source = match rootfs {

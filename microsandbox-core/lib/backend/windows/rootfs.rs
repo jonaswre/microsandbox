@@ -191,10 +191,7 @@ impl WindowsRootfsMaterializer {
         }
 
         // Write the cache manifest for integrity validation.
-        let source_size = fs::metadata(tar_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let source_size = fs::metadata(tar_path).await.map(|m| m.len()).unwrap_or(0);
 
         let manifest = LayerVhdManifest {
             digest: digest.to_string(),
@@ -317,11 +314,7 @@ impl WindowsRootfsMaterializer {
             workdir: spec.workdir.as_ref().map(|w| w.to_string()),
             exec_path: spec.exec.path.to_string(),
             exec_args: spec.exec.args.clone(),
-            env: spec
-                .env
-                .iter()
-                .map(|e| e.to_string())
-                .collect(),
+            env: spec.env.iter().map(|e| e.to_string()).collect(),
         })?;
         fs::write(patch_staging.join("sandbox-spec.json"), spec_json).await?;
 
@@ -339,10 +332,7 @@ impl WindowsRootfsMaterializer {
             .output()
             .await
             .map_err(|e| {
-                MicrosandboxError::LayerExtraction(format!(
-                    "failed to create patch VHD: {}",
-                    e
-                ))
+                MicrosandboxError::LayerExtraction(format!("failed to create patch VHD: {}", e))
             })?;
 
         if !output.status.success() {
@@ -406,10 +396,7 @@ impl WindowsRootfsMaterializer {
             .output()
             .await
             .map_err(|e| {
-                MicrosandboxError::LayerExtraction(format!(
-                    "failed to create scratch VHDX: {}",
-                    e
-                ))
+                MicrosandboxError::LayerExtraction(format!("failed to create scratch VHDX: {}", e))
             })?;
 
         if !output.status.success() {
@@ -483,9 +470,7 @@ impl RootfsMaterializer for WindowsRootfsMaterializer {
                         .and_then(|s| s.to_str())
                         .unwrap_or("unknown");
 
-                    let vhd_path = self
-                        .get_or_create_layer_vhd(layer_path, digest)
-                        .await?;
+                    let vhd_path = self.get_or_create_layer_vhd(layer_path, digest).await?;
                     layer_vhds.push(vhd_path);
                 }
 
@@ -504,12 +489,12 @@ impl RootfsMaterializer for WindowsRootfsMaterializer {
             RootfsSource::Native(_) => Err(MicrosandboxError::NotImplemented(
                 "Native rootfs is not supported on Windows — use OCI images".to_string(),
             )),
-            RootfsSource::OciImage { reference } => Err(MicrosandboxError::NotImplemented(
-                format!(
+            RootfsSource::OciImage { reference } => {
+                Err(MicrosandboxError::NotImplemented(format!(
                     "OCI image materialization should be done before calling materialize(): {}",
                     reference
-                ),
-            )),
+                )))
+            }
         }
     }
 }
@@ -591,18 +576,12 @@ mod tests {
             "sha256_abc123def456"
         );
         assert_eq!(sanitize_digest("no_colon"), "no_colon");
-        assert_eq!(
-            sanitize_digest("sha256:a:b:c"),
-            "sha256_a_b_c"
-        );
+        assert_eq!(sanitize_digest("sha256:a:b:c"), "sha256_a_b_c");
     }
 
     #[test]
     fn test_cache_key_from_digest() {
-        assert_eq!(
-            cache_key_from_digest("sha256:abc123"),
-            "sha256_abc123"
-        );
+        assert_eq!(cache_key_from_digest("sha256:abc123"), "sha256_abc123");
     }
 
     #[test]
@@ -615,10 +594,7 @@ mod tests {
         let materializer = WindowsRootfsMaterializer::new(config);
 
         let dir = materializer.layer_cache_dir("sha256:abc123");
-        assert_eq!(
-            dir,
-            PathBuf::from("/cache/windows/layers/sha256_abc123")
-        );
+        assert_eq!(dir, PathBuf::from("/cache/windows/layers/sha256_abc123"));
     }
 
     #[test]

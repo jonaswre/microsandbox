@@ -9,10 +9,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    MicrosandboxError, MicrosandboxResult,
-    backend::ProcessSupervisor,
-};
+use crate::{MicrosandboxError, MicrosandboxResult, backend::ProcessSupervisor};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -129,14 +126,7 @@ impl WindowsSupervisor {
 
         // If we don't have a PID, try to open the pipe.
         let output = tokio::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Test-Path '{}'",
-                    pipe
-                ),
-            ])
+            .args(["-NoProfile", "-Command", &format!("Test-Path '{}'", pipe)])
             .output()
             .await;
 
@@ -235,11 +225,7 @@ impl ProcessSupervisor for WindowsSupervisor {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Process may have already exited — not necessarily an error.
-            tracing::debug!(
-                pid = pid,
-                "taskkill result: {}",
-                stderr
-            );
+            tracing::debug!(pid = pid, "taskkill result: {}", stderr);
         }
 
         Ok(())
@@ -327,10 +313,7 @@ mod tests {
         }
 
         // Attach request.
-        let msg = PipeMessage::AttachRequest {
-            cols: 80,
-            rows: 24,
-        };
+        let msg = PipeMessage::AttachRequest { cols: 80, rows: 24 };
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: PipeMessage = serde_json::from_str(&json).unwrap();
         match deserialized {
