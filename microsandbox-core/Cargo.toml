@@ -39,7 +39,6 @@ once_cell.workspace = true
 pin-project-lite.workspace = true
 pretty-error-debug.workspace = true
 regex.workspace = true
-reqwest.workspace = true
 reqwest-middleware.workspace = true
 reqwest-retry.workspace = true
 scopeguard.workspace = true
@@ -48,7 +47,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
@@ -71,7 +69,13 @@ nix = { workspace = true, features = [
     "user",
 ] }
 psutil.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls"] }
 xattr.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
+sqlx = { workspace = true, features = ["runtime-tokio-native-tls"] }
 
 [dev-dependencies]
 rstest.workspace = true

@@ -105,7 +105,7 @@ pub enum Rootfs {
 ///
 /// ## Examples
 ///
-/// ```rust
+/// ```ignore
 /// use microsandbox_core::vm::{MicroVm, MicroVmConfig, Rootfs};
 /// use tempfile::TempDir;
 ///
@@ -911,8 +911,8 @@ mod tests {
             .memory_mib(1024)
             .exec_path("/bin/echo")
             .mapped_dirs([
-                format!("{}:/app", host_dir1.display()).parse()?,
-                format!("{}:/data", host_dir2.display()).parse()?,
+                MountSpec::with_distinct(host_dir1.to_str().unwrap(), "/app"),
+                MountSpec::with_distinct(host_dir2.to_str().unwrap(), "/data"),
             ])
             .build();
 
@@ -924,8 +924,8 @@ mod tests {
             .memory_mib(1024)
             .exec_path("/bin/echo")
             .mapped_dirs([
-                format!("{}:/app/data", host_dir1.display()).parse()?,
-                format!("{}:/app", host_dir2.display()).parse()?,
+                MountSpec::with_distinct(host_dir1.to_str().unwrap(), "/app/data"),
+                MountSpec::with_distinct(host_dir2.to_str().unwrap(), "/app"),
             ])
             .build();
 

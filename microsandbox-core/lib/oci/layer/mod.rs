@@ -205,10 +205,10 @@ impl LayerOps for Layer {
         #[cfg(not(unix))]
         {
             let _ = parent;
-            return Err(MicrosandboxError::LayerExtraction(
-                "Layer extraction with ownership override is not supported on this platform"
-                    .to_string(),
-            ));
+            // On Windows, layer extraction is a no-op — the Windows rootfs materializer
+            // converts tarballs directly to VHDs via tar2ext4 instead of extracting to disk.
+            tracing::info!("Skipping layer extraction on Windows (tarballs used directly)");
+            return Ok(());
         }
 
         #[cfg(unix)]

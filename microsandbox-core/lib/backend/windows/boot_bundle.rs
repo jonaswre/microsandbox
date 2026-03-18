@@ -150,6 +150,33 @@ pub async fn load_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResul
     Ok(BootBundle { dir, manifest })
 }
 
+/// Loads an existing boot bundle or returns an error with instructions.
+///
+/// Attempts to load the boot bundle from the runtime directory.
+/// If not found, returns an error telling the user where to place the files.
+pub async fn ensure_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResult<BootBundle> {
+    match load_bundle(runtime_dir, version).await {
+        Ok(bundle) => {
+            tracing::info!(
+                version = %bundle.manifest.version,
+                dir = %bundle.dir.display(),
+                "Boot bundle loaded"
+            );
+            Ok(bundle)
+        }
+        Err(_) => {
+            let expected_dir = bundle_dir(runtime_dir, version);
+            Err(MicrosandboxError::PathNotFound(format!(
+                "Boot bundle v{} not found at {}. \
+                 Please download the boot bundle and extract it to that directory. \
+                 Expected files: kernel, rootfs.vhd, bootstrap, portal, tar2ext4.exe, manifest.json",
+                version,
+                expected_dir.display()
+            )))
+        }
+    }
+}
+
 /// Checks if a boot bundle version is compatible with the current host version.
 pub fn check_compatibility(
     bundle: &BootBundleManifest,

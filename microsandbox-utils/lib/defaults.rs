@@ -54,14 +54,14 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub static DEFAULT_MSBRUN_EXE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let current_exe = std::env::current_exe().unwrap();
     let actual_exe = fs::canonicalize(current_exe).unwrap();
-    actual_exe.parent().unwrap().join("msbrun")
+    actual_exe.parent().unwrap().join(if cfg!(windows) { "msbrun.exe" } else { "msbrun" })
 });
 
 /// The default path to the msbserver binary.
 pub static DEFAULT_MSBSERVER_EXE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let current_exe = std::env::current_exe().unwrap();
     let actual_exe = fs::canonicalize(current_exe).unwrap();
-    actual_exe.parent().unwrap().join("msbserver")
+    actual_exe.parent().unwrap().join(if cfg!(windows) { "msbserver.exe" } else { "msbserver" })
 });
 
 /// The default working directory for the sandbox.

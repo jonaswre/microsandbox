@@ -200,6 +200,85 @@ pub(crate) async fn save_or_update_sandbox(
     }
 }
 
+/// Saves or updates a sandbox record with full backend-aware fields.
+///
+/// This variant stores `RuntimeHandle` fields (control_endpoint, backend_object_id, etc.)
+/// and is used by the Windows HCS backend path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_or_update_sandbox_runtime(
+    pool: &Pool<Sqlite>,
+    name: &str,
+    config_file: &str,
+    config_last_modified: &DateTime<Utc>,
+    status: &str,
+    worker_pid: u32,
+    backend_kind: &str,
+    runtime_id: &str,
+    control_endpoint: &str,
+    backend_object_id: &str,
+) -> MicrosandboxResult<i64> {
+    // Try to update first
+    let update_result = sqlx::query(
+        r#"
+        UPDATE sandboxes
+        SET config_last_modified = ?,
+            status = ?,
+            supervisor_pid = ?,
+            microvm_pid = 0,
+            rootfs_paths = '',
+            backend_kind = ?,
+            runtime_id = ?,
+            control_endpoint = ?,
+            backend_object_id = ?,
+            modified_at = CURRENT_TIMESTAMP
+        WHERE name = ? AND config_file = ?
+        RETURNING id
+        "#,
+    )
+    .bind(config_last_modified.to_rfc3339())
+    .bind(status)
+    .bind(worker_pid)
+    .bind(backend_kind)
+    .bind(runtime_id)
+    .bind(control_endpoint)
+    .bind(backend_object_id)
+    .bind(name)
+    .bind(config_file)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(record) = update_result {
+        tracing::debug!("updated existing sandbox record (runtime)");
+        Ok(record.get::<i64, _>("id"))
+    } else {
+        tracing::debug!("creating new sandbox record (runtime)");
+        let record = sqlx::query(
+            r#"
+            INSERT INTO sandboxes (
+                name, config_file, config_last_modified,
+                status, supervisor_pid, microvm_pid, rootfs_paths,
+                backend_kind, runtime_id, control_endpoint, backend_object_id
+            )
+            VALUES (?, ?, ?, ?, ?, 0, '', ?, ?, ?, ?)
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(config_file)
+        .bind(config_last_modified.to_rfc3339())
+        .bind(status)
+        .bind(worker_pid)
+        .bind(backend_kind)
+        .bind(runtime_id)
+        .bind(control_endpoint)
+        .bind(backend_object_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(record.get::<i64, _>("id"))
+    }
+}
+
 pub(crate) async fn get_sandbox(
     pool: &Pool<Sqlite>,
     name: &str,

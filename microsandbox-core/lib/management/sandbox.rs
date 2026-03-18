@@ -98,46 +98,131 @@ pub async fn run(
     exec: Option<&str>,
     use_image_defaults: bool,
 ) -> MicrosandboxResult<()> {
-    // Prepare the command
-    let (mut command, is_detached) = prepare_run(
-        sandbox_name,
-        script_name,
-        project_dir,
-        config_file,
-        args,
-        detach,
-        exec,
-        use_image_defaults,
-    )
-    .await?;
+    // On Windows, use the HCS backend path instead of the Unix supervisor.
+    #[cfg(windows)]
+    {
+        use crate::backend::VmBackend;
+        use crate::backend::windows::{boot_bundle, WindowsHcsBackend, WindowsHcsConfig};
+        use microsandbox_utils::platform::platform_paths;
 
-    // Spawn the command
-    let mut child = command.spawn()?;
+        let spec = resolve_sandbox_spec(
+            sandbox_name,
+            script_name,
+            project_dir,
+            config_file,
+            args,
+            exec,
+            use_image_defaults,
+        )
+        .await?;
 
-    tracing::info!(
-        "started supervisor process with PID: {}",
-        child.id().unwrap_or(0)
-    );
+        let paths = platform_paths();
+        let runtime_dir = paths.runtime_home();
+        let cache_dir = paths.cache_home();
 
-    // If in detached mode, don't wait for the child process to complete
-    if is_detached {
+        let bundle = boot_bundle::ensure_bundle(&runtime_dir, "0.2.6").await?;
+
+        let current_exe = std::env::current_exe().map_err(|e| {
+            MicrosandboxError::SupervisorBinaryNotFound(format!(
+                "Failed to determine current executable path: {}",
+                e
+            ))
+        })?;
+        let worker_path = current_exe
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("msbrun-hcs.exe");
+
+        let backend = WindowsHcsBackend::new(WindowsHcsConfig {
+            boot_bundle_dir: bundle.dir.clone(),
+            worker_path,
+            cache_dir,
+            runtime_dir,
+        });
+
+        let handle = backend.start(&spec).await?;
+        tracing::info!(
+            "started sandbox '{}' via Windows HCS backend (PID: {})",
+            sandbox_name,
+            handle.worker_pid
+        );
+
+        if detach {
+            return Ok(());
+        }
+
+        // Wait for the worker process to exit.
+        // The worker inherits stdin/stdout and relays them to the VM's serial console
+        // via a named pipe, so interactive I/O works without explicit forwarding here.
+        // We poll the process since we don't own the Child handle (it's inside start()).
+        loop {
+            let output = tokio::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {}", handle.worker_pid), "/NH"])
+                .output()
+                .await;
+
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    if !stdout.contains(&handle.worker_pid.to_string()) {
+                        break; // process exited
+                    }
+                }
+                Err(_) => break,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        // Clean up networking on exit.
+        let _ = backend.stop(&handle).await;
+
         return Ok(());
     }
 
-    // Wait for the child process to complete
-    let status = child.wait().await?;
-    if !status.success() {
-        tracing::error!(
-            "child process — supervisor — exited with status: {}",
-            status
-        );
-        return Err(MicrosandboxError::SupervisorError(format!(
-            "child process — supervisor — failed with exit status: {}",
-            status
-        )));
-    }
+    // Unix path: use msbrun supervisor
+    #[cfg(unix)]
+    {
+        // Prepare the command
+        let (mut command, is_detached) = prepare_run(
+            sandbox_name,
+            script_name,
+            project_dir,
+            config_file,
+            args,
+            detach,
+            exec,
+            use_image_defaults,
+        )
+        .await?;
 
-    Ok(())
+        // Spawn the command
+        let mut child = command.spawn()?;
+
+        tracing::info!(
+            "started supervisor process with PID: {}",
+            child.id().unwrap_or(0)
+        );
+
+        // If in detached mode, don't wait for the child process to complete
+        if is_detached {
+            return Ok(());
+        }
+
+        // Wait for the child process to complete
+        let status = child.wait().await?;
+        if !status.success() {
+            tracing::error!(
+                "child process — supervisor — exited with status: {}",
+                status
+            );
+            return Err(MicrosandboxError::SupervisorError(format!(
+                "child process — supervisor — failed with exit status: {}",
+                status
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// Prepares a sandbox command for execution without running it.
@@ -404,31 +489,110 @@ pub async fn resolve_sandbox_spec(
     // Get the config last modified timestamp
     let config_last_modified: DateTime<Utc> = fs::metadata(&config_path).await?.modified()?.into();
 
-    // Setup rootfs
-    let rootfs = match sandbox_config.get_image().clone() {
+    // Setup rootfs — on Windows, pull the image but use tarball paths (not extracted dirs).
+    // The WindowsRootfsMaterializer converts tarballs to VHDs via tar2ext4.
+    #[cfg(windows)]
+    let rootfs_source = match sandbox_config.get_image().clone() {
         ReferenceOrPath::Path(root_path) => {
-            setup_native_rootfs(
-                &canonical_project_dir.join(root_path),
-                sandbox_name,
-                &sandbox_config,
-                &config_file,
-                &config_last_modified,
-                &sandbox_pool,
-            )
-            .await?
+            RootfsSource::Native(canonical_project_dir.join(root_path))
         }
         ReferenceOrPath::Reference(ref reference) => {
-            setup_image_rootfs(
-                reference,
-                sandbox_name,
-                &mut sandbox_config,
-                &menv_path,
-                &config_file,
-                &config_last_modified,
-                &sandbox_pool,
-                use_image_defaults,
-            )
-            .await?
+            tracing::info!(?reference, "pulling image for Windows backend");
+            Image::pull(reference.clone(), None).await?;
+
+            let microsandbox_home_path = env::get_microsandbox_home_path();
+            let oci_db_path = microsandbox_home_path.join(OCI_DB_FILENAME);
+            let layers_dir = microsandbox_home_path.join(LAYERS_SUBDIR);
+            let oci_pool =
+                db::get_or_create_pool(&oci_db_path, &db::OCI_DB_MIGRATOR).await?;
+
+            // Apply image configuration defaults if enabled.
+            if use_image_defaults {
+                config::apply_image_defaults(&mut sandbox_config, reference, &oci_pool).await?;
+            }
+
+            // Get layer digests and locate their tarballs (not extracted dirs).
+            let digests =
+                db::get_image_layer_digests(&oci_pool, &reference.to_string()).await?;
+            let layers = db::get_layers_by_digest(&oci_pool, &digests).await?;
+            tracing::info!("found {} layers for image {}", layers.len(), reference);
+
+            let mut layer_tarball_paths = Vec::new();
+            for layer in &layers {
+                // Layer tarballs are stored as <digest>.tar in the layers dir.
+                let tar_path = layers_dir.join(format!("{}.tar", layer.digest));
+                if tar_path.exists() {
+                    layer_tarball_paths.push(tar_path);
+                } else {
+                    // Try without extension
+                    let alt = layers_dir.join(&layer.digest);
+                    if alt.exists() {
+                        layer_tarball_paths.push(alt);
+                    } else {
+                        return Err(MicrosandboxError::PathNotFound(format!(
+                            "layer tarball for {} not found in {}",
+                            layer.digest,
+                            layers_dir.display()
+                        )));
+                    }
+                }
+            }
+
+            RootfsSource::Overlayfs {
+                layers: layer_tarball_paths,
+                patch_dir: PathBuf::new(),
+                rw_dir: PathBuf::new(),
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let rootfs_source = {
+        let rootfs = match sandbox_config.get_image().clone() {
+            ReferenceOrPath::Path(root_path) => {
+                setup_native_rootfs(
+                    &canonical_project_dir.join(root_path),
+                    sandbox_name,
+                    &sandbox_config,
+                    &config_file,
+                    &config_last_modified,
+                    &sandbox_pool,
+                )
+                .await?
+            }
+            ReferenceOrPath::Reference(ref reference) => {
+                setup_image_rootfs(
+                    reference,
+                    sandbox_name,
+                    &mut sandbox_config,
+                    &menv_path,
+                    &config_file,
+                    &config_last_modified,
+                    &sandbox_pool,
+                    use_image_defaults,
+                )
+                .await?
+            }
+        };
+
+        match rootfs {
+            Rootfs::Native(path) => RootfsSource::Native(path),
+            Rootfs::Overlayfs(paths) => {
+                let len = paths.len();
+                if len >= 3 {
+                    RootfsSource::Overlayfs {
+                        layers: paths[..len - 2].to_vec(),
+                        patch_dir: paths[len - 2].clone(),
+                        rw_dir: paths[len - 1].clone(),
+                    }
+                } else {
+                    RootfsSource::Overlayfs {
+                        layers: paths,
+                        patch_dir: PathBuf::new(),
+                        rw_dir: PathBuf::new(),
+                    }
+                }
+            }
         }
     };
 
@@ -439,26 +603,30 @@ pub async fn resolve_sandbox_spec(
     // Combine user args with exec args
     let final_args = if !args.is_empty() { args } else { exec_args };
 
-    // Convert rootfs to RootfsSource
-    let rootfs_source = match rootfs {
-        Rootfs::Native(path) => RootfsSource::Native(path),
-        Rootfs::Overlayfs(paths) => {
-            // The last path is the RW layer, second-to-last is the patch layer
-            let len = paths.len();
-            if len >= 3 {
-                RootfsSource::Overlayfs {
-                    layers: paths[..len - 2].to_vec(),
-                    patch_dir: paths[len - 2].clone(),
-                    rw_dir: paths[len - 1].clone(),
-                }
+    // On Windows, the guest bootstrap runs as PID 1 with no PATH.
+    // Non-absolute exec paths (e.g. `echo hello`) must be wrapped in `/bin/sh -c`
+    // so the shell resolves them. Absolute paths with embedded args (e.g.
+    // `/bin/echo hello`) are split into program + argv.
+    #[cfg(windows)]
+    let (exec_path, final_args) = {
+        let first_token = exec_path.split_whitespace().next().unwrap_or(&exec_path);
+        if !first_token.starts_with('/') {
+            // Non-absolute: wrap in shell
+            let full_cmd = if final_args.is_empty() {
+                exec_path
             } else {
-                // Fallback: treat all as layers
-                RootfsSource::Overlayfs {
-                    layers: paths,
-                    patch_dir: PathBuf::new(),
-                    rw_dir: PathBuf::new(),
-                }
-            }
+                format!("{} {}", exec_path, final_args.join(" "))
+            };
+            ("/bin/sh".to_string(), vec!["-c".to_string(), full_cmd])
+        } else if exec_path.contains(' ') && final_args.is_empty() {
+            // Absolute path with embedded args: split into program + args
+            let mut parts = exec_path.splitn(2, ' ');
+            let program = parts.next().unwrap().to_string();
+            let rest = parts.next().unwrap_or("");
+            let args: Vec<String> = rest.split_whitespace().map(|s| s.to_string()).collect();
+            (program, args)
+        } else {
+            (exec_path, final_args)
         }
     };
 
@@ -479,6 +647,14 @@ pub async fn resolve_sandbox_spec(
         })
         .collect();
 
+    // On Windows, enable the portal for host-to-guest communication.
+    #[cfg(windows)]
+    let portal = Some(crate::backend::PortalConfig {
+        guest_port: microsandbox_utils::DEFAULT_PORTAL_GUEST_PORT,
+    });
+    #[cfg(not(windows))]
+    let portal = None;
+
     Ok(ResolvedSandboxSpec {
         sandbox_key: sandbox_name.to_string(),
         rootfs_source,
@@ -496,7 +672,7 @@ pub async fn resolve_sandbox_spec(
             rlimits: Vec::new(),
         },
         scope: *sandbox_config.get_scope(),
-        portal: None,
+        portal,
     })
 }
 

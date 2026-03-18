@@ -13,55 +13,25 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
+	winio "github.com/Microsoft/go-winio"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/nicholasgasior/microsandbox/microsandbox-hcs-worker/internal/hcn"
+	"github.com/nicholasgasior/microsandbox/microsandbox-hcs-worker/internal/hcs"
+	"github.com/nicholasgasior/microsandbox/microsandbox-hcs-worker/internal/pipe"
 )
-
-// ComputeConfig is the HCS compute system configuration, matching the Rust
-// HcsComputeConfig struct.
-type ComputeConfig struct {
-	Name              string           `json:"name"`
-	KernelPath        string           `json:"kernel_path"`
-	InitrdPath        string           `json:"initrd_path"`
-	MemoryMiB         uint32           `json:"memory_mib"`
-	VcpuCount         uint8            `json:"vcpu_count"`
-	ScsiAttachments   []ScsiAttachment `json:"scsi_attachments"`
-	Plan9Shares       []Plan9Share     `json:"plan9_shares"`
-	NetworkEndpointID *string          `json:"network_endpoint_id"`
-}
-
-// ScsiAttachment represents a VHD to attach via SCSI.
-type ScsiAttachment struct {
-	Path       string `json:"path"`
-	ReadOnly   bool   `json:"readonly"`
-	Controller uint32 `json:"controller"`
-	Lun        uint32 `json:"lun"`
-}
-
-// Plan9Share represents a host directory mount.
-type Plan9Share struct {
-	Name      string `json:"name"`
-	HostPath  string `json:"host_path"`
-	GuestPath string `json:"guest_path"`
-	Flags     uint32 `json:"flags"`
-}
-
-// PipeMessage represents the named pipe protocol messages.
-type PipeMessage struct {
-	Type     string  `json:"type"`
-	State    string  `json:"state,omitempty"`
-	GuestPID *uint32 `json:"guest_pid,omitempty"`
-	Success  *bool   `json:"success,omitempty"`
-	Error    *string `json:"error,omitempty"`
-	Cols     uint16  `json:"cols,omitempty"`
-	Rows     uint16  `json:"rows,omitempty"`
-}
 
 func main() {
 	pipePath := flag.String("pipe", "", "Named pipe path for control channel")
@@ -73,8 +43,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Normalize pipe path — ensure proper \\.\pipe\ prefix.
+	normalizedPipe := *pipePath
+	if !strings.HasPrefix(normalizedPipe, `\\.\pipe\`) {
+		normalizedPipe = `\\.\pipe\` + normalizedPipe
+	}
+
 	log.WithFields(log.Fields{
-		"pipe":   *pipePath,
+		"pipe":   normalizedPipe,
 		"config": *configPath,
 	}).Info("msbrun-hcs worker starting")
 
@@ -84,7 +60,7 @@ func main() {
 		log.WithError(err).Fatal("Failed to read compute configuration")
 	}
 
-	var config ComputeConfig
+	var config hcs.ComputeConfig
 	if err := json.Unmarshal(configData, &config); err != nil {
 		log.WithError(err).Fatal("Failed to parse compute configuration")
 	}
@@ -97,61 +73,153 @@ func main() {
 		"shares": len(config.Plan9Shares),
 	}).Info("Loaded compute configuration")
 
-	// Create HCS compute system.
-	if err := createComputeSystem(&config); err != nil {
+	// Set up HCN networking if requested.
+	var endpointID string
+	var lbIDs []string
+	if config.NetworkEndpointID == nil || *config.NetworkEndpointID == "" {
+		// No endpoint pre-assigned — set up networking here.
+		netID, err := hcn.EnsureNATNetwork("microsandbox-nat", "172.28.0.0/16", "172.28.176.1")
+		if err != nil {
+			log.WithError(err).Warn("HCN networking unavailable — VM will run without network")
+		} else {
+			epID, epIP, err := hcn.CreateEndpoint(netID, "msb-"+config.Name)
+			if err != nil {
+				log.WithError(err).Warn("Failed to create HCN endpoint")
+			} else {
+				endpointID = epID
+				config.NetworkEndpointID = &epID
+				log.WithFields(log.Fields{"endpoint": epID, "ip": epIP}).Info("HCN endpoint created")
+
+				// Create portal load balancer (port 4444).
+				if lbID, err := hcn.CreateLoadBalancer(epID, 4444, 4444); err == nil {
+					lbIDs = append(lbIDs, lbID)
+				} else {
+					log.WithError(err).Warn("Failed to create portal load balancer")
+				}
+			}
+		}
+	}
+
+	// Build HCS V2 schema document from our config.
+	doc := hcs.BuildHcsDocument(&config)
+
+	// Create and start the HCS compute system.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	system, err := hcs.CreateAndStart(ctx, doc, config.Name)
+	if err != nil {
+		// Clean up networking on HCS failure.
+		cleanupHCN(endpointID, lbIDs)
 		log.WithError(err).Fatal("Failed to create HCS compute system")
 	}
 
-	log.Info("HCS compute system created, waiting for commands")
+	log.Info("HCS compute system created and started")
+
+	// Connect to the VM console pipe and relay I/O to host stdin/stdout.
+	if config.ConsolePipePath != "" {
+		go relayConsole(ctx, config.ConsolePipePath)
+	}
+
+	// Start the named pipe server in a goroutine.
+	pipeServer := pipe.NewServer(normalizedPipe, cancel)
+	go func() {
+		if err := pipeServer.ListenAndServe(ctx); err != nil {
+			log.WithError(err).Error("Named pipe server error")
+			cancel()
+		}
+	}()
 
 	// Handle OS signals for graceful shutdown.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Listen on the named pipe for control commands.
-	// For now, just wait for a signal.
-	// TODO: Implement named pipe listener with full protocol support.
-	<-sigChan
-
-	log.Info("Received shutdown signal, cleaning up")
-
-	// Teardown HCS compute system.
-	if err := teardownComputeSystem(&config); err != nil {
-		log.WithError(err).Error("Failed to clean up compute system")
-		os.Exit(1)
+	// Wait for shutdown signal (OS signal or pipe stop command).
+	select {
+	case sig := <-sigChan:
+		log.WithField("signal", sig).Info("Received shutdown signal")
+		cancel()
+	case <-ctx.Done():
+		log.Info("Shutdown requested via control channel")
 	}
+
+	// Stop the pipe server.
+	pipeServer.Stop()
+
+	// Teardown the HCS compute system.
+	log.Info("Shutting down HCS compute system")
+	if err := system.Shutdown(30 * time.Second); err != nil {
+		log.WithError(err).Error("Failed to clean up compute system")
+	}
+
+	// Clean up HCN networking resources.
+	cleanupHCN(endpointID, lbIDs)
 
 	log.Info("Cleanup complete, exiting")
 }
 
-// createComputeSystem creates an HCS compute system using the provided configuration.
-// This is a placeholder — the full implementation will use hcsshim's CreateComputeSystem.
-func createComputeSystem(config *ComputeConfig) error {
-	log.WithField("name", config.Name).Info("Creating HCS compute system")
-
-	// TODO: Implement using hcsshim:
-	// 1. Build hcsshim.SchemaV2 document from config
-	// 2. Set LinuxKernelDirect boot with kernel and initrd paths
-	// 3. Configure memory and CPU limits
-	// 4. Add SCSI attachments for layer VHDs
-	// 5. Add Plan9 shares for host mounts
-	// 6. Set network endpoint if configured
-	// 7. Call hcsshim.CreateComputeSystem()
-	// 8. Start the compute system
-
-	return nil
+// cleanupHCN removes HCN load balancers and endpoint.
+func cleanupHCN(endpointID string, lbIDs []string) {
+	for _, id := range lbIDs {
+		if err := hcn.DeleteLoadBalancer(id); err != nil {
+			log.WithError(err).WithField("id", id).Debug("Failed to delete load balancer")
+		}
+	}
+	if endpointID != "" {
+		if err := hcn.DeleteEndpoint(endpointID); err != nil {
+			log.WithError(err).WithField("id", endpointID).Debug("Failed to delete endpoint")
+		} else {
+			log.Info("Cleaned up HCN networking")
+		}
+	}
 }
 
-// teardownComputeSystem terminates the HCS compute system and cleans up resources.
-func teardownComputeSystem(config *ComputeConfig) error {
-	log.WithField("name", config.Name).Info("Tearing down HCS compute system")
+// relayConsole connects to the HCS console named pipe and bridges it with
+// the host's stdin/stdout. Console output goes to os.Stdout; host keyboard
+// input goes to the VM's serial console.
+func relayConsole(ctx context.Context, pipePath string) {
+	conn, err := connectToConsolePipe(ctx, pipePath)
+	if err != nil {
+		log.WithError(err).Warn("Could not connect to console pipe — VM output will not be visible")
+		return
+	}
+	defer conn.Close()
 
-	// TODO: Implement using hcsshim:
-	// 1. Terminate the compute system
-	// 2. Wait for shutdown
-	// 3. Close the compute system handle
-	// 4. Detach VHDs
-	// 5. Remove Plan9 shares
+	log.WithField("pipe", pipePath).Info("Console pipe connected, relaying I/O")
 
-	return nil
+	// Console output → host stdout.
+	go func() {
+		if _, err := io.Copy(os.Stdout, conn); err != nil && ctx.Err() == nil {
+			log.WithError(err).Debug("Console output relay stopped")
+		}
+	}()
+
+	// Host stdin → console input (blocks until stdin closes or context cancels).
+	go func() {
+		if _, err := io.Copy(conn, os.Stdin); err != nil && ctx.Err() == nil {
+			log.WithError(err).Debug("Console input relay stopped")
+		}
+	}()
+
+	// Keep alive until the context is done.
+	<-ctx.Done()
+}
+
+// connectToConsolePipe retries connecting to the HCS console named pipe.
+// HCS creates the pipe when the compute system starts; there may be a short
+// delay before it is available.
+func connectToConsolePipe(ctx context.Context, pipePath string) (net.Conn, error) {
+	timeout := 100 * time.Millisecond
+	for i := 0; i < 30; i++ {
+		conn, err := winio.DialPipe(pipePath, &timeout)
+		if err == nil {
+			return conn, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return nil, fmt.Errorf("timeout connecting to console pipe %s", pipePath)
 }

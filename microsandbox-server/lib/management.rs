@@ -211,6 +211,13 @@ pub async fn start(
             });
         }
 
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        }
+
         // Redirect the I/O to null
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());

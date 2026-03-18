@@ -583,7 +583,8 @@ mod tests {
                 memory: 1024
                 cpus: 2
                 volumes:
-                  - "./src:/app/src"
+                  - host: "./src"
+                    guest: "/app/src"
                 ports:
                   - "8080:80"
                 envs:
@@ -657,7 +658,8 @@ mod tests {
                 memory: 2048
                 cpus: 2
                 volumes:
-                  - "./requirements.txt:/build/requirements.txt"
+                  - host: "./requirements.txt"
+                    guest: "/build/requirements.txt"
                 envs:
                   - "PYTHON_VERSION=3.11"
                 workdir: "/build"
@@ -676,7 +678,8 @@ mod tests {
                 memory: 1024
                 cpus: 1
                 volumes:
-                  - "./api:/app/src"
+                  - host: "./api"
+                    guest: "/app/src"
                 ports:
                   - "8000:8000"
                 envs:

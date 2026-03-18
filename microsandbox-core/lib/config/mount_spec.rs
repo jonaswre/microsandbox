@@ -22,6 +22,7 @@ use crate::MicrosandboxError;
 /// use std::path::PathBuf;
 ///
 /// let host = HostPathBuf::from(PathBuf::from("/home/user/project"));
+/// #[cfg(unix)]
 /// assert!(host.is_absolute());
 /// assert_eq!(host.to_string(), "/home/user/project");
 /// ```

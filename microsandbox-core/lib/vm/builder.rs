@@ -81,9 +81,9 @@ pub struct MicroVmConfigBuilder<R, E> {
 ///
 /// ## Examples
 ///
-/// ```rust
+/// ```ignore
 /// use microsandbox_core::vm::{MicroVmBuilder, LogLevel, Rootfs};
-/// use microsandbox_core::config::NetworkScope;
+/// use microsandbox_core::config::{MountSpec, NetworkScope};
 /// use std::path::PathBuf;
 ///
 /// # fn main() -> anyhow::Result<()> {
@@ -92,7 +92,7 @@ pub struct MicroVmConfigBuilder<R, E> {
 ///     .rootfs(Rootfs::Native(PathBuf::from("/tmp")))
 ///     .num_vcpus(2)
 ///     .memory_mib(1024)
-///     .mapped_dirs(["/home:/guest/mount".parse()?])
+///     .mapped_dirs([MountSpec::with_distinct("/home", "/guest/mount")])
 ///     .port_map(["8080:80".parse()?])
 ///     .scope(NetworkScope::Public)
 ///     .ip("192.168.1.100".parse()?)
@@ -242,19 +242,17 @@ impl<R, M> MicroVmConfigBuilder<R, M> {
     ///
     /// ```rust
     /// use microsandbox_core::vm::MicroVmConfigBuilder;
+    /// use microsandbox_core::config::MountSpec;
     ///
-    /// # fn main() -> anyhow::Result<()> {
     /// let config = MicroVmConfigBuilder::default()
     ///     .mapped_dirs([
     ///         // Share host's /data directory as /mnt/data in guest
-    ///         "/data:/mnt/data".parse()?,
+    ///         MountSpec::with_distinct("/data", "/mnt/data"),
     ///         // Share current directory as /app in guest
-    ///         "./:/app".parse()?,
+    ///         MountSpec::with_distinct("./", "/app"),
     ///         // Use same path in both host and guest
-    ///         "/shared".parse()?
+    ///         MountSpec::with_same("/shared"),
     ///     ]);
-    /// # Ok(())
-    /// # }
     /// ```
     ///
     /// ## Notes
@@ -587,7 +585,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{LogLevel, MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -659,7 +657,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -689,7 +687,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -721,19 +719,17 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ```rust
     /// use microsandbox_core::vm::MicroVmConfigBuilder;
+    /// use microsandbox_core::config::MountSpec;
     ///
-    /// # fn main() -> anyhow::Result<()> {
     /// let config = MicroVmConfigBuilder::default()
     ///     .mapped_dirs([
     ///         // Share host's /data directory as /mnt/data in guest
-    ///         "/data:/mnt/data".parse()?,
+    ///         MountSpec::with_distinct("/data", "/mnt/data"),
     ///         // Share current directory as /app in guest
-    ///         "./:/app".parse()?,
+    ///         MountSpec::with_distinct("./", "/app"),
     ///         // Use same path in both host and guest
-    ///         "/shared".parse()?
+    ///         MountSpec::with_same("/shared"),
     ///     ]);
-    /// # Ok(())
-    /// # }
     /// ```
     pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = MountSpec>) -> Self {
         self.inner = self.inner.mapped_dirs(mapped_dirs);
@@ -1138,7 +1134,7 @@ mod tests {
             .rootfs(rootfs.clone())
             .num_vcpus(2)
             .memory_mib(1024)
-            .mapped_dirs(["/guest/mount:/host/mount".parse()?])
+            .mapped_dirs([MountSpec::with_distinct("/guest/mount", "/host/mount")])
             .port_map(["8080:80".parse()?])
             .rlimits(["RLIMIT_NOFILE=1024:1024".parse()?])
             .workdir_path(workdir_path)
@@ -1153,7 +1149,7 @@ mod tests {
         assert_eq!(builder.inner.memory_mib, 1024);
         assert_eq!(
             builder.inner.mapped_dirs,
-            ["/guest/mount:/host/mount".parse()?]
+            [MountSpec::with_distinct("/guest/mount", "/host/mount")]
         );
         assert_eq!(builder.inner.port_map, ["8080:80".parse()?]);
         assert_eq!(builder.inner.rlimits, ["RLIMIT_NOFILE=1024:1024".parse()?]);

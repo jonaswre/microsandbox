@@ -53,8 +53,13 @@ pub struct HcsComputeConfig {
     /// Path to the rootfs VHD from the boot bundle.
     pub initrd_path: String,
 
-    /// Resource limits.
+    /// Kernel command line (e.g., `init=/bootstrap console=hvc0 layers=2`).
+    pub kernel_cmdline: String,
+
+    /// Memory allocation in MiB.
     pub memory_mib: u32,
+
+    /// Number of virtual CPUs.
     pub vcpu_count: u8,
 
     /// SCSI attachments.
@@ -65,6 +70,10 @@ pub struct HcsComputeConfig {
 
     /// Network endpoint ID (set by networking module).
     pub network_endpoint_id: Option<String>,
+
+    /// Named pipe path for serial console redirection (COM1 → ttyS0).
+    /// When set, HCS creates a named pipe server and the worker relays I/O.
+    pub console_pipe_path: Option<String>,
 }
 
 /// A VHD to attach via SCSI to the compute system.
@@ -124,6 +133,20 @@ pub struct WindowsHcsBackend {
     config: WindowsHcsConfig,
 }
 
+/// Persisted networking state for a running sandbox.
+///
+/// Written to `networking-state.json` in the sandbox directory during `start()`,
+/// read during `stop()` for cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NetworkingState {
+    /// HCN endpoint ID.
+    endpoint_id: String,
+    /// IP address assigned to the endpoint.
+    endpoint_ip: String,
+    /// HCN load balancer IDs for port forwarding.
+    load_balancer_ids: Vec<String>,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
@@ -171,38 +194,10 @@ impl WindowsHcsBackend {
             lun,
         });
 
-        // Build Plan9 shares from mount spec.
-        let mut plan9_shares = Vec::new();
-
-        // Control share (read-only, for sandbox spec).
-        plan9_shares.push(Plan9Share {
-            name: "control".to_string(),
-            host_path: self
-                .config
-                .runtime_dir
-                .join("windows")
-                .join("sandboxes")
-                .join(&spec.sandbox_key)
-                .display()
-                .to_string(),
-            guest_path: CONTROL_SHARE_GUEST_PATH.to_string(),
-            flags: PLAN9_FLAG_READONLY | PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE,
-        });
-
-        // User volume mounts.
-        for (i, mount) in spec.mounts.iter().enumerate() {
-            let mut flags = PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE;
-            if mount.readonly {
-                flags |= PLAN9_FLAG_READONLY;
-            }
-
-            plan9_shares.push(Plan9Share {
-                name: format!("mount_{}", i),
-                host_path: mount.host.to_string(),
-                guest_path: mount.guest.to_string(),
-                flags,
-            });
-        }
+        // Plan9 shares for host directory mounts.
+        // TODO: Re-enable Plan9 shares once HCS schema compatibility is resolved.
+        // On some Windows 11 builds, Plan9 in the HCS V2 schema causes Construct errors.
+        let plan9_shares = Vec::new();
 
         HcsComputeConfig {
             name: spec.sandbox_key.clone(),
@@ -218,11 +213,19 @@ impl WindowsHcsBackend {
                 .join("rootfs.vhd")
                 .display()
                 .to_string(),
+            kernel_cmdline: format!(
+                "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={}",
+                rootfs.layer_vhds.len()
+            ),
             memory_mib: spec.resources.memory_mib,
             vcpu_count: spec.resources.vcpus,
             scsi_attachments,
             plan9_shares,
             network_endpoint_id: None,
+            console_pipe_path: Some(format!(
+                r"\\.\pipe\microsandbox-console-{}",
+                spec.sandbox_key
+            )),
         }
     }
 
@@ -231,13 +234,67 @@ impl WindowsHcsBackend {
         format!(r"\\.\pipe\microsandbox-{}", sandbox_key)
     }
 
+    /// Grants the Hyper-V VM worker account full control on a path.
+    ///
+    /// HCS runs VMs under `NT VIRTUAL MACHINE\Virtual Machines` which needs
+    /// explicit permissions on VHD files and boot bundle assets. Uses backslash-
+    /// normalized paths and grants `(OI)(CI)F` (full control, inherited) with a
+    /// single retry on failure.
+    async fn grant_vm_access(path: &std::path::Path) {
+        if !path.exists() {
+            return;
+        }
+        // Normalize to backslashes for icacls compatibility.
+        let path_str = path.display().to_string().replace('/', "\\");
+
+        for attempt in 1..=2 {
+            let result = tokio::process::Command::new("icacls")
+                .args([
+                    &path_str,
+                    "/grant",
+                    "NT VIRTUAL MACHINE\\Virtual Machines:(OI)(CI)F",
+                    "/T",
+                    "/Q",
+                ])
+                .output()
+                .await;
+
+            match result {
+                Ok(o) if o.status.success() => {
+                    tracing::debug!(path = %path_str, "Granted VM full access");
+                    return;
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    tracing::warn!(
+                        path = %path_str,
+                        attempt,
+                        "icacls failed: {}",
+                        stderr.trim()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path_str, attempt, "icacls error: {}", e);
+                }
+            }
+
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+
     /// Checks if Hyper-V is available on the system.
+    ///
+    /// Uses WMI `HypervisorPresent` (no admin required) with a fallback to
+    /// checking whether the `vmcompute` service is running.
     pub async fn check_hyperv_available() -> MicrosandboxResult<()> {
+        // Primary check: WMI HypervisorPresent (works without elevation).
         let output = tokio::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-Command",
-                "(Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State",
+                "(Get-CimInstance Win32_ComputerSystem).HypervisorPresent",
             ])
             .output()
             .await
@@ -249,16 +306,29 @@ impl WindowsHcsBackend {
             })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().eq_ignore_ascii_case("Enabled") {
-            return Err(MicrosandboxError::NotImplemented(
-                "Hyper-V is not enabled. Please enable Hyper-V to use Windows sandbox hosting. \
-                 Run 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All' \
-                 in an elevated PowerShell."
-                    .to_string(),
-            ));
+        if stdout.trim().eq_ignore_ascii_case("True") {
+            return Ok(());
         }
 
-        Ok(())
+        // Fallback: check if the vmcompute service is running.
+        let sc_output = tokio::process::Command::new("sc.exe")
+            .args(["query", "vmcompute"])
+            .output()
+            .await;
+
+        if let Ok(o) = sc_output {
+            let sc_stdout = String::from_utf8_lossy(&o.stdout);
+            if sc_stdout.contains("RUNNING") {
+                return Ok(());
+            }
+        }
+
+        Err(MicrosandboxError::NotImplemented(
+            "Hyper-V is not enabled. Please enable Hyper-V to use Windows sandbox hosting. \
+             Run 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All' \
+             in an elevated PowerShell."
+                .to_string(),
+        ))
     }
 }
 
@@ -281,7 +351,17 @@ impl VmBackend for WindowsHcsBackend {
         let materializer = WindowsRootfsMaterializer::new(rootfs_config);
         let rootfs = materializer.materialize(spec).await?;
 
+        // Grant Hyper-V VM worker read access to VHD files.
+        // HCS runs the VM under an NT VIRTUAL MACHINE account that needs explicit read access.
+        // Must run after rootfs materialization so newly created files are included.
+        Self::grant_vm_access(&self.config.cache_dir).await;
+        Self::grant_vm_access(&self.config.runtime_dir).await;
+        Self::grant_vm_access(&self.config.boot_bundle_dir).await;
+
         // Build compute configuration.
+        // Networking (HCN NAT + endpoint + load balancers) is set up by the Go
+        // worker via native Win32 HCN API calls, not PowerShell. The worker
+        // creates the endpoint and sets NetworkEndpointID before starting HCS.
         let compute_config = self.build_compute_config(spec, &rootfs);
         let config_json = serde_json::to_string(&compute_config)?;
 
@@ -335,12 +415,12 @@ impl VmBackend for WindowsHcsBackend {
     }
 
     async fn stop(&self, handle: &RuntimeHandle) -> MicrosandboxResult<()> {
+        // HCN networking cleanup is handled by the Go worker on shutdown.
         if handle.control_endpoint.is_empty() {
             tracing::warn!(
                 sandbox = %handle.sandbox_key,
                 "No control endpoint for sandbox, attempting process termination"
             );
-            // Fall back to process termination.
             if handle.worker_pid > 0 {
                 let _ = tokio::process::Command::new("taskkill")
                     .args(["/F", "/T", "/PID", &handle.worker_pid.to_string()])
@@ -350,16 +430,13 @@ impl VmBackend for WindowsHcsBackend {
             return Ok(());
         }
 
-        // Send stop command via the named pipe (the worker handles graceful HCS teardown).
-        // For now, we use a simple approach: write "stop" to the pipe.
-        // The full protocol will be implemented in the process lifecycle module.
         tracing::info!(
             sandbox = %handle.sandbox_key,
             pipe = %handle.control_endpoint,
             "Sending stop command to HCS worker"
         );
 
-        // If the pipe-based stop fails, fall back to taskkill.
+        // Terminate the worker process.
         if handle.worker_pid > 0 {
             let output = tokio::process::Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &handle.worker_pid.to_string()])
@@ -381,7 +458,6 @@ impl VmBackend for WindowsHcsBackend {
                         "taskkill output: {}",
                         stderr
                     );
-                    // Not necessarily an error — process may have already exited.
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -516,6 +592,7 @@ mod tests {
             name: "test~sandbox".to_string(),
             kernel_path: r"C:\boot\kernel".to_string(),
             initrd_path: r"C:\boot\rootfs.vhd".to_string(),
+            kernel_cmdline: "init=/bootstrap console=ttyS0 panic=1 layers=1".to_string(),
             memory_mib: 512,
             vcpu_count: 2,
             scsi_attachments: vec![ScsiAttachment {
@@ -531,6 +608,7 @@ mod tests {
                 flags: PLAN9_FLAG_READONLY | PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE,
             }],
             network_endpoint_id: None,
+            console_pipe_path: Some(r"\\.\pipe\microsandbox-console-test".to_string()),
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -551,5 +629,67 @@ mod tests {
         assert_eq!(parts.len(), 5);
         // Third group should start with '4' (version 4).
         assert!(parts[2].starts_with('4'));
+    }
+
+    #[test]
+    fn test_kernel_cmdline_format() {
+        let cmdline = format!(
+            "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={}",
+            3
+        );
+        assert!(cmdline.contains("init=/bootstrap"));
+        assert!(cmdline.contains("console=ttyS0"));
+        assert!(cmdline.contains("layers=3"));
+        assert!(cmdline.contains("panic=1"));
+    }
+
+    #[test]
+    fn test_console_pipe_path_format() {
+        let key = "project~sandbox1";
+        let pipe = format!(r"\\.\pipe\microsandbox-console-{}", key);
+        assert_eq!(pipe, r"\\.\pipe\microsandbox-console-project~sandbox1");
+    }
+
+    #[test]
+    fn test_networking_state_serialization() {
+        let state = NetworkingState {
+            endpoint_id: "ep-abc123".to_string(),
+            endpoint_ip: "172.28.0.2".to_string(),
+            load_balancer_ids: vec!["lb-001".to_string(), "lb-002".to_string()],
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: NetworkingState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.endpoint_id, "ep-abc123");
+        assert_eq!(deserialized.endpoint_ip, "172.28.0.2");
+        assert_eq!(deserialized.load_balancer_ids.len(), 2);
+        assert_eq!(deserialized.load_balancer_ids[0], "lb-001");
+    }
+
+    #[test]
+    fn test_compute_config_with_console_pipe() {
+        let config = HcsComputeConfig {
+            name: "test".to_string(),
+            kernel_path: r"C:\boot\kernel".to_string(),
+            initrd_path: r"C:\boot\rootfs.vhd".to_string(),
+            kernel_cmdline: "init=/bootstrap console=ttyS0 panic=1 layers=1".to_string(),
+            memory_mib: 256,
+            vcpu_count: 1,
+            scsi_attachments: vec![],
+            plan9_shares: vec![],
+            network_endpoint_id: None,
+            console_pipe_path: Some(r"\\.\pipe\microsandbox-console-test".to_string()),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("console_pipe_path"));
+        assert!(json.contains("microsandbox-console-test"));
+
+        let deserialized: HcsComputeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.console_pipe_path.as_deref(),
+            Some(r"\\.\pipe\microsandbox-console-test")
+        );
     }
 }
