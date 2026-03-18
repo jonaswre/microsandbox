@@ -269,7 +269,7 @@ impl AsyncWrite for RotatingLog {
                     if size + buf_len > this.max_size {
                         let old_file = std::mem::replace(
                             &mut this.file,
-                            File::from_std(std::fs::File::open("/dev/null").unwrap()),
+                            File::from_std(std::fs::File::open(if cfg!(windows) { "NUL" } else { "/dev/null" }).unwrap()),
                         );
                         let old_path = this.path.clone();
                         let fut = Box::pin(do_rotation(old_file, old_path));

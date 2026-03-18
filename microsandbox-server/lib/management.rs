@@ -93,7 +93,7 @@ pub async fn start(
         let pid_str = fs::read_to_string(&pid_file_path).await?;
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             // Check if process is actually running
-            let process_running = unsafe { libc::kill(pid, 0) == 0 };
+            let process_running = is_process_running(pid);
 
             if process_running {
                 #[cfg(feature = "cli")]
@@ -203,6 +203,7 @@ pub async fn start(
     }
 
     if detach {
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
                 libc::setsid();
@@ -210,8 +211,14 @@ pub async fn start(
             });
         }
 
-        // TODO: Redirect to log file
-        // Redirect the i/o to /dev/null
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        }
+
+        // Redirect the I/O to null
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());
         command.stdin(Stdio::null());
@@ -260,84 +267,87 @@ pub async fn start(
         return Ok(());
     }
 
-    // Set up signal handlers for graceful shutdown
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(|e| {
-            #[cfg(feature = "cli")]
-            term::finish_with_error(&start_server_sp);
+    // Wait for child process to exit or signal to be received
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| {
+                MicrosandboxServerError::StartError(format!(
+                    "failed to set up signal handlers: {}",
+                    e
+                ))
+            })?;
 
-            MicrosandboxServerError::StartError(format!("failed to set up signal handlers: {}", e))
-        })?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| {
+                MicrosandboxServerError::StartError(format!(
+                    "failed to set up signal handlers: {}",
+                    e
+                ))
+            })?;
 
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|e| {
-            #[cfg(feature = "cli")]
-            term::finish_with_error(&start_server_sp);
-
-            MicrosandboxServerError::StartError(format!("failed to set up signal handlers: {}", e))
-        })?;
-
-    // Wait for either child process to exit or signal to be received
-    tokio::select! {
-        status = child.wait() => {
-            if !status.as_ref().is_ok_and(|s| s.success()) {
-                tracing::error!(
-                    "child process — sandbox server — exited with status: {:?}",
-                    status
-                );
-
-                // Clean up PID file if process fails
+        tokio::select! {
+            status = child.wait() => {
+                if !status.as_ref().is_ok_and(|s| s.success()) {
+                    tracing::error!(
+                        "child process — sandbox server — exited with status: {:?}",
+                        status
+                    );
+                    clean(&pid_file_path).await?;
+                    return Err(MicrosandboxServerError::StartError(format!(
+                        "child process — sandbox server — failed with exit status: {:?}",
+                        status
+                    )));
+                }
                 clean(&pid_file_path).await?;
-
-                #[cfg(feature = "cli")]
-                term::finish_with_error(&start_server_sp);
-
-                return Err(MicrosandboxServerError::StartError(format!(
-                    "child process — sandbox server — failed with exit status: {:?}",
-                    status
-                )));
             }
-
-            // Clean up PID file on successful exit
-            clean(&pid_file_path).await?;
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM signal");
+                if let Err(e) = child.kill().await {
+                    tracing::error!("failed to kill child process: {}", e);
+                }
+                let _ = child.wait().await;
+                clean(&pid_file_path).await?;
+                tracing::info!("server terminated by SIGTERM signal");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT signal");
+                if let Err(e) = child.kill().await {
+                    tracing::error!("failed to kill child process: {}", e);
+                }
+                let _ = child.wait().await;
+                clean(&pid_file_path).await?;
+                tracing::info!("server terminated by SIGINT signal");
+            }
         }
-        _ = sigterm.recv() => {
-            tracing::info!("received SIGTERM signal");
+    }
 
-            // Send SIGTERM to child process
-            if let Err(e) = child.kill().await {
-                tracing::error!("failed to send SIGTERM to child process: {}", e);
+    #[cfg(windows)]
+    {
+        tokio::select! {
+            status = child.wait() => {
+                if !status.as_ref().is_ok_and(|s| s.success()) {
+                    tracing::error!(
+                        "child process — sandbox server — exited with status: {:?}",
+                        status
+                    );
+                    clean(&pid_file_path).await?;
+                    return Err(MicrosandboxServerError::StartError(format!(
+                        "child process — sandbox server — failed with exit status: {:?}",
+                        status
+                    )));
+                }
+                clean(&pid_file_path).await?;
             }
-
-            // Wait for child to exit after sending signal
-            if let Err(e) = child.wait().await {
-                tracing::error!("error waiting for child after SIGTERM: {}", e);
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received Ctrl+C signal");
+                if let Err(e) = child.kill().await {
+                    tracing::error!("failed to kill child process: {}", e);
+                }
+                let _ = child.wait().await;
+                clean(&pid_file_path).await?;
+                tracing::info!("server terminated by Ctrl+C signal");
             }
-
-            // Clean up PID file after signal
-            clean(&pid_file_path).await?;
-
-            // Exit with a message
-            tracing::info!("server terminated by SIGTERM signal");
-        }
-        _ = sigint.recv() => {
-            tracing::info!("received SIGINT signal");
-
-            // Send SIGTERM to child process
-            if let Err(e) = child.kill().await {
-                tracing::error!("failed to send SIGTERM to child process: {}", e);
-            }
-
-            // Wait for child to exit after sending signal
-            if let Err(e) = child.wait().await {
-                tracing::error!("error waiting for child after SIGINT: {}", e);
-            }
-
-            // Clean up PID file after signal
-            clean(&pid_file_path).await?;
-
-            // Exit with a message
-            tracing::info!("server terminated by SIGINT signal");
         }
     }
 
@@ -368,30 +378,17 @@ pub async fn stop() -> MicrosandboxServerResult<()> {
         MicrosandboxServerError::StopError("invalid PID found in server.pid file".to_string())
     })?;
 
-    // Send SIGTERM to the process
-    unsafe {
-        if libc::kill(pid, libc::SIGTERM) != 0 {
-            // If process doesn't exist, clean up PID file and return error
-            if std::io::Error::last_os_error().raw_os_error().unwrap() == libc::ESRCH {
-                // Delete only the PID file
-                clean(&pid_file_path).await?;
+    // Terminate the server process
+    if let Err(e) = terminate_process(pid) {
+        clean(&pid_file_path).await?;
 
-                #[cfg(feature = "cli")]
-                term::finish_with_error(&stop_server_sp);
+        #[cfg(feature = "cli")]
+        term::finish_with_error(&stop_server_sp);
 
-                return Err(MicrosandboxServerError::StopError(
-                    "server process not found (stale PID file removed)".to_string(),
-                ));
-            }
-
-            #[cfg(feature = "cli")]
-            term::finish_with_error(&stop_server_sp);
-
-            return Err(MicrosandboxServerError::StopError(format!(
-                "failed to stop server process (PID: {})",
-                pid
-            )));
-        }
+        return Err(MicrosandboxServerError::StopError(format!(
+            "failed to stop server process (PID: {}): {}",
+            pid, e
+        )));
     }
 
     // Clean up just the PID file
@@ -512,4 +509,64 @@ fn generate_random_key() -> String {
 pub fn convert_jwt_to_api_key(jwt_token: &str) -> MicrosandboxServerResult<String> {
     // Create custom API key format: API_KEY_PREFIX + full JWT token
     Ok(format!("{}{}", API_KEY_PREFIX, jwt_token))
+}
+
+/// Check if a process with the given PID is running.
+#[cfg(unix)]
+fn is_process_running(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Check if a process with the given PID is running (Windows).
+///
+/// Uses `tasklist` to check if a process with the given PID exists.
+#[cfg(windows)]
+fn is_process_running(pid: i32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output();
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.contains(&pid.to_string())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Terminate a process by PID.
+#[cfg(unix)]
+fn terminate_process(pid: i32) -> Result<(), String> {
+    unsafe {
+        if libc::kill(pid, libc::SIGTERM) != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Err("server process not found (stale PID file removed)".to_string());
+            }
+            return Err(format!("kill failed: {}", err));
+        }
+    }
+    Ok(())
+}
+
+/// Terminate a process by PID (Windows).
+///
+/// Uses `taskkill /F /T /PID` to forcefully terminate the process tree.
+#[cfg(windows)]
+fn terminate_process(pid: i32) -> Result<(), String> {
+    let output = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("failed to run taskkill: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not found") {
+            return Err("server process not found (stale PID file removed)".to_string());
+        }
+        return Err(format!("taskkill failed: {}", stderr));
+    }
+
+    Ok(())
 }

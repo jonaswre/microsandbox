@@ -1,0 +1,20 @@
+[package]
+name = "microsandbox-bootstrap"
+version = "0.2.6"
+edition = "2021"
+license = "Apache-2.0"
+description = "PID 1 init process for microsandbox Windows-hosted Linux VMs"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

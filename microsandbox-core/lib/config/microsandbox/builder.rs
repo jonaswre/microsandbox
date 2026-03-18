@@ -6,7 +6,7 @@ use typed_path::Utf8UnixPathBuf;
 
 use crate::{
     MicrosandboxResult,
-    config::{EnvPair, PathPair, PortPair, ReferenceOrPath},
+    config::{EnvPair, MountSpec, PortPair, ReferenceOrPath},
 };
 
 use super::{Build, Meta, Microsandbox, Module, NetworkScope, Sandbox};
@@ -59,7 +59,7 @@ pub struct SandboxBuilder<I> {
     image: I,
     memory: Option<u32>,
     cpus: Option<u8>,
-    volumes: Vec<PathPair>,
+    volumes: Vec<MountSpec>,
     ports: Vec<PortPair>,
     envs: Vec<EnvPair>,
     env_file: Option<Utf8UnixPathBuf>,
@@ -169,7 +169,7 @@ impl<I> SandboxBuilder<I> {
     }
 
     /// Sets the volumes to mount for the sandbox
-    pub fn volumes(mut self, volumes: impl IntoIterator<Item = PathPair>) -> SandboxBuilder<I> {
+    pub fn volumes(mut self, volumes: impl IntoIterator<Item = MountSpec>) -> SandboxBuilder<I> {
         self.volumes = volumes.into_iter().collect();
         self
     }

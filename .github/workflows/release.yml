@@ -80,6 +80,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-26
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -109,20 +111,73 @@ jobs:
           fi
           echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
           echo "Version: ${VERSION#v}"
+        shell: bash
 
-      - name: Build and package
+      - name: Build and package (Unix)
+        if: matrix.os != 'windows-latest'
         run: |
           ./scripts/package_microsandbox.sh ${{ steps.version.outputs.version }}
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
 
-      - name: Upload release assets
+      # --- Windows-specific steps ---
+
+      - name: Setup Go (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install cargo-zigbuild and musl target (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
+          rustup target add x86_64-unknown-linux-musl
+        shell: bash
+
+      - name: Download kernel from boot-assets (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          gh release download boot-assets --pattern "kernel" --dir . --repo ${{ github.repository }} --clobber || echo "::warning::kernel not found in boot-assets release, boot bundle will be incomplete"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+
+      - name: Build tar2ext4 from hcsshim (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          git clone --depth 1 https://github.com/microsoft/hcsshim.git "$env:RUNNER_TEMP\hcsshim"
+          Push-Location "$env:RUNNER_TEMP\hcsshim\cmd\tar2ext4"
+          go build -o "$env:GITHUB_WORKSPACE\tar2ext4.exe" .
+          Pop-Location
+          Write-Host "tar2ext4.exe built"
+        shell: pwsh
+
+      - name: Build and package (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/Package-WindowsRelease.ps1 -Version ${{ steps.version.outputs.version }}
+        shell: bash
+
+      - name: Upload release assets (Unix)
         uses: softprops/action-gh-release@v1
-        if: needs.release-please.outputs.tag_name != ''
+        if: needs.release-please.outputs.tag_name != '' && matrix.os != 'windows-latest'
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: |
             build/microsandbox-*.tar.gz
             build/microsandbox-*.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release assets (Windows)
+        uses: softprops/action-gh-release@v1
+        if: needs.release-please.outputs.tag_name != '' && matrix.os == 'windows-latest'
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: |
+            build/microsandbox-*.zip
+            build/microsandbox-*.zip.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

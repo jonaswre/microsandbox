@@ -15,7 +15,7 @@
 
 use std::{fs, path::PathBuf, sync::LazyLock};
 
-use crate::MICROSANDBOX_HOME_DIR;
+use crate::platform::platform_paths;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -31,8 +31,9 @@ pub const DEFAULT_NUM_VCPUS: u8 = 1;
 pub const DEFAULT_MEMORY_MIB: u32 = 1024;
 
 /// The path where all microsandbox global data is stored.
+/// Uses platform-aware resolution via `PlatformPaths`.
 pub static DEFAULT_MICROSANDBOX_HOME: LazyLock<PathBuf> =
-    LazyLock::new(|| dirs::home_dir().unwrap().join(MICROSANDBOX_HOME_DIR));
+    LazyLock::new(|| platform_paths().data_home());
 
 /// The default OCI registry domain.
 pub const DEFAULT_OCI_REGISTRY: &str = "docker.io";
@@ -53,14 +54,14 @@ pub const DEFAULT_SHELL: &str = "/bin/sh";
 pub static DEFAULT_MSBRUN_EXE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let current_exe = std::env::current_exe().unwrap();
     let actual_exe = fs::canonicalize(current_exe).unwrap();
-    actual_exe.parent().unwrap().join("msbrun")
+    actual_exe.parent().unwrap().join(if cfg!(windows) { "msbrun.exe" } else { "msbrun" })
 });
 
 /// The default path to the msbserver binary.
 pub static DEFAULT_MSBSERVER_EXE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let current_exe = std::env::current_exe().unwrap();
     let actual_exe = fs::canonicalize(current_exe).unwrap();
-    actual_exe.parent().unwrap().join("msbserver")
+    actual_exe.parent().unwrap().join(if cfg!(windows) { "msbserver.exe" } else { "msbserver" })
 });
 
 /// The default working directory for the sandbox.

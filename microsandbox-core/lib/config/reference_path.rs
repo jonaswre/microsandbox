@@ -55,8 +55,11 @@ impl FromStr for ReferenceOrPath {
     /// let full = ReferenceOrPath::from_str("docker.io/library/debian:11").unwrap();
     /// ```
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Check if the string starts with "." or "/" to determine if it's a path
-        if s.starts_with('.') || s.starts_with('/') {
+        // Check if the string is a filesystem path:
+        // - Starts with "." or "/" (Unix-style paths)
+        // - Windows drive letter (e.g., "C:\...", "D:/...")
+        // - UNC path (e.g., "\\server\share\...")
+        if s.starts_with('.') || s.starts_with('/') || is_windows_path(s) {
             Ok(ReferenceOrPath::Path(PathBuf::from(s)))
         } else {
             // Parse as an image reference
@@ -87,6 +90,34 @@ impl From<ReferenceOrPath> for String {
     fn from(val: ReferenceOrPath) -> Self {
         val.to_string()
     }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Detects whether a string looks like a Windows filesystem path.
+///
+/// Matches:
+/// - Drive letter paths: `X:\...` or `X:/...` (where X is a-zA-Z)
+/// - UNC paths: `\\server\...`
+fn is_windows_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+
+    // Drive letter: e.g., "C:\..." or "C:/..."
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let sep = bytes[2];
+        if sep == b'\\' || sep == b'/' {
+            return true;
+        }
+    }
+
+    // UNC path: "\\server\..."
+    if bytes.len() >= 3 && bytes[0] == b'\\' && bytes[1] == b'\\' {
+        return true;
+    }
+
+    false
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -310,5 +341,80 @@ mod tests {
         // Test deserializing invalid reference format
         let invalid_reference = "invalid!reference:format";
         assert!(serde_yaml::from_str::<ReferenceOrPath>(invalid_reference).is_err());
+    }
+
+    #[test]
+    fn test_windows_drive_letter_path() {
+        let cases = vec![
+            r"C:\Users\jonas\rootfs",
+            r"D:\projects\my-rootfs",
+            r"E:\data",
+        ];
+
+        for case in cases {
+            let reference = ReferenceOrPath::from_str(case).unwrap();
+            match &reference {
+                ReferenceOrPath::Path(_) => {}
+                _ => panic!("Expected Path variant for {}", case),
+            }
+        }
+    }
+
+    #[test]
+    fn test_windows_drive_letter_forward_slash() {
+        let reference = ReferenceOrPath::from_str("C:/Users/jonas/rootfs").unwrap();
+        assert!(matches!(reference, ReferenceOrPath::Path(_)));
+    }
+
+    #[test]
+    fn test_unc_path() {
+        let cases = vec![r"\\server\share\rootfs", r"\\192.168.1.1\data\rootfs"];
+
+        for case in cases {
+            let reference = ReferenceOrPath::from_str(case).unwrap();
+            match &reference {
+                ReferenceOrPath::Path(_) => {}
+                _ => panic!("Expected Path variant for {}", case),
+            }
+        }
+    }
+
+    #[test]
+    fn test_oci_reference_not_confused_with_windows_path() {
+        // These should still be OCI references, not paths
+        let cases = vec![
+            "alpine:latest",
+            "docker.io/library/ubuntu:latest",
+            "registry.example.com:5000/myapp:v1.0",
+        ];
+
+        for case in cases {
+            let reference = ReferenceOrPath::from_str(case).unwrap();
+            assert!(
+                matches!(reference, ReferenceOrPath::Reference(_)),
+                "Expected Reference variant for {}",
+                case,
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_windows_path_helper() {
+        // Drive letter paths
+        assert!(is_windows_path(r"C:\Users\jonas"));
+        assert!(is_windows_path("D:/projects"));
+        assert!(is_windows_path(r"Z:\"));
+
+        // UNC paths
+        assert!(is_windows_path(r"\\server\share"));
+        assert!(is_windows_path(r"\\192.168.1.1\data"));
+
+        // Not Windows paths
+        assert!(!is_windows_path("alpine:latest"));
+        assert!(!is_windows_path("/unix/path"));
+        assert!(!is_windows_path("./relative"));
+        assert!(!is_windows_path("C:notapath")); // No separator after colon
+        assert!(!is_windows_path("")); // Empty
+        assert!(!is_windows_path("C")); // Too short
     }
 }

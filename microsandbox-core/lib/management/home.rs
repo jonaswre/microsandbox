@@ -6,17 +6,18 @@
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
-    config::{EnvPair, Microsandbox, PathPair, PortPair, ReferenceOrPath, Sandbox},
+    config::{EnvPair, Microsandbox, MountSpec, PortPair, ReferenceOrPath, Sandbox},
     management::{config, db, menv},
     oci::{Image, Reference},
 };
 use microsandbox_utils::{
-    MICROSANDBOX_CONFIG_FILENAME, MICROSANDBOX_HOME_DIR, OCI_DB_FILENAME, XDG_BIN_DIR,
-    XDG_HOME_DIR, env, path::INSTALLS_SUBDIR,
+    MICROSANDBOX_CONFIG_FILENAME, MICROSANDBOX_HOME_DIR, OCI_DB_FILENAME, env,
+    path::INSTALLS_SUBDIR, platform::platform_paths,
 };
 
 #[cfg(feature = "cli")]
 use microsandbox_utils::term;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tokio::fs;
 use typed_path::Utf8UnixPathBuf;
@@ -208,7 +209,7 @@ pub async fn install(
     menv::initialize(Some(installs_path.clone())).await?;
 
     // Parse the volume, port, and env strings into their respective types
-    let volumes: Vec<PathPair> = volumes.into_iter().filter_map(|v| v.parse().ok()).collect();
+    let volumes: Vec<MountSpec> = volumes.into_iter().filter_map(|v| v.parse().ok()).collect();
     let ports: Vec<PortPair> = ports.into_iter().filter_map(|p| p.parse().ok()).collect();
     let envs: Vec<EnvPair> = envs.into_iter().filter_map(|e| e.parse().ok()).collect();
 
@@ -287,8 +288,8 @@ pub async fn install(
     fs::write(&config_path, serde_yaml::to_string(&config)?).await?;
     tracing::info!("Wrote config to {}", config_path.display());
 
-    // Create the alias script in ~/.local/bin
-    let bin_dir = XDG_HOME_DIR.join(XDG_BIN_DIR);
+    // Create the alias script in the platform bin directory
+    let bin_dir = platform_paths().bin_dir();
 
     // Create the bin directory if it doesn't exist
     fs::create_dir_all(&bin_dir).await?;
@@ -299,10 +300,13 @@ pub async fn install(
     // Write the script file
     fs::write(&script_path, script_content).await?;
 
-    // Make the script executable
-    let mut perms = std::fs::metadata(&script_path)?.permissions();
-    perms.set_mode(0o755); // rwxr-xr-x
-    std::fs::set_permissions(&script_path, perms)?;
+    // Make the script executable (Unix only)
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755); // rwxr-xr-x
+        std::fs::set_permissions(&script_path, perms)?;
+    }
 
     tracing::info!("Created alias script at {}", script_path.display());
 
@@ -339,7 +343,7 @@ pub async fn install(
 /// ```
 pub async fn uninstall(script_name: &str) -> MicrosandboxResult<()> {
     // Get the bin directory path
-    let bin_dir = XDG_HOME_DIR.join(XDG_BIN_DIR);
+    let bin_dir = platform_paths().bin_dir();
     let script_path = bin_dir.join(script_name);
 
     // Check if the script exists
@@ -384,22 +388,13 @@ pub async fn uninstall(script_name: &str) -> MicrosandboxResult<()> {
 
 /// Check if a command with the given name exists in the system PATH
 ///
-/// This function uses `which` to check if a command exists in any directory
-/// listed in the PATH environment variable.
-///
 /// ## Arguments
 /// * `command` - The name of the command to check
 ///
 /// ## Returns
 /// Returns `true` if the command exists in PATH, `false` otherwise
 fn command_exists(command: &str) -> bool {
-    use std::process::Command;
-
-    Command::new("which")
-        .arg(command)
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    which::which(command).is_ok()
 }
 
 /// Extracts a simple name from an OCI image reference

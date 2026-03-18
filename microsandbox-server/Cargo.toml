@@ -19,13 +19,11 @@ console = { workspace = true, optional = true }
 getset.workspace = true
 indicatif = { workspace = true, optional = true }
 jsonwebtoken.workspace = true
-libc.workspace = true
 microsandbox-core.workspace = true
 microsandbox-utils.workspace = true
 once_cell.workspace = true
 pretty-error-debug.workspace = true
 rand.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -34,6 +32,13 @@ tokio.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+reqwest = { workspace = true, features = ["native-tls"] }
 
 [features]
 cli = ["console", "indicatif"]

@@ -6,23 +6,26 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(unix)]
 use async_compression::tokio::bufread::GzipDecoder;
 use async_trait::async_trait;
 
 use microsandbox_utils::EXTRACTED_LAYER_SUFFIX;
 use oci_spec::image::Digest;
+#[cfg(unix)]
+use tokio::io::BufReader;
 use tokio::{
     fs,
-    io::BufReader,
     sync::{Mutex, OwnedMutexGuard},
 };
+#[cfg(unix)]
 use tokio_tar::Archive;
 
+#[cfg(unix)]
+use crate::oci::extraction::extract_tar_with_ownership_override;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
-    oci::{
-        extraction::extract_tar_with_ownership_override, global_cache::GlobalCacheOps, image::Image,
-    },
+    oci::{global_cache::GlobalCacheOps, image::Image},
 };
 
 #[async_trait]
@@ -159,43 +162,56 @@ impl LayerOps for Layer {
         digest = %self.digest(),
     ))]
     async fn extract(&self, parent: LayerDependencies) -> MicrosandboxResult<()> {
-        assert_eq!(self.digest(), parent.digest());
-        let (false, _guard) = self.extracted().await? else {
+        #[cfg(unix)]
+        {
+            assert_eq!(self.digest(), parent.digest());
+            let (false, _guard) = self.extracted().await? else {
+                return Ok(());
+            };
+
+            let layer_path = self.tar_path();
+            let digest = self.digest().clone();
+            let extract_dir = self.extracted_layer_dir();
+            fs::create_dir_all(&extract_dir).await.map_err(|source| {
+                MicrosandboxError::LayerHandling {
+                    layer: digest.to_string(),
+                    source,
+                }
+            })?;
+
+            tracing::info!("Extracting layer");
+
+            let file = tokio::fs::File::open(&layer_path).await?;
+            #[cfg(feature = "cli")]
+            let (file, pb) = {
+                use crate::oci::layer::progress::{ProgressReader, build_progress_bar};
+
+                let total_bytes = fs::metadata(&layer_path).await?.len();
+                let bar = build_progress_bar(total_bytes, &digest.digest()[..8]);
+                let bar_clone = bar.clone();
+                (ProgressReader { inner: file, bar }, bar_clone)
+            };
+
+            let mut archive = Archive::new(GzipDecoder::new(BufReader::new(file)));
+            extract_tar_with_ownership_override(&mut archive, &extract_dir, parent)
+                .await
+                .map_err(|e| MicrosandboxError::LayerExtraction(format!("{e:?}")))?;
+
+            #[cfg(feature = "cli")]
+            pb.finish_and_clear();
+
+            tracing::info!("Successfully extracted layer");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            // On Windows, layer extraction is a no-op — the Windows rootfs materializer
+            // converts tarballs directly to VHDs via tar2ext4 instead of extracting to disk.
+            tracing::info!("Skipping layer extraction on Windows (tarballs used directly)");
             return Ok(());
-        };
+        }
 
-        let layer_path = self.tar_path();
-        let digest = self.digest().clone();
-        let extract_dir = self.extracted_layer_dir();
-        fs::create_dir_all(&extract_dir).await.map_err(|source| {
-            MicrosandboxError::LayerHandling {
-                layer: digest.to_string(),
-                source,
-            }
-        })?;
-
-        tracing::info!("Extracting layer");
-
-        let file = tokio::fs::File::open(&layer_path).await?;
-        #[cfg(feature = "cli")]
-        let (file, pb) = {
-            use crate::oci::layer::progress::{ProgressReader, build_progress_bar};
-
-            let total_bytes = fs::metadata(&layer_path).await?.len();
-            let bar = build_progress_bar(total_bytes, &digest.digest()[..8]);
-            let bar_clone = bar.clone();
-            (ProgressReader { inner: file, bar }, bar_clone)
-        };
-
-        let mut archive = Archive::new(GzipDecoder::new(BufReader::new(file)));
-        extract_tar_with_ownership_override(&mut archive, &extract_dir, parent)
-            .await
-            .map_err(|e| MicrosandboxError::LayerExtraction(format!("{e:?}")))?;
-
-        #[cfg(feature = "cli")]
-        pb.finish_and_clear();
-
-        tracing::info!("Successfully extracted layer");
+        #[cfg(unix)]
         Ok(())
     }
 

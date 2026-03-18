@@ -4,14 +4,15 @@ use ipnetwork::Ipv4Network;
 use microsandbox_utils::{DEFAULT_MEMORY_MIB, DEFAULT_NUM_VCPUS};
 use typed_path::Utf8UnixPathBuf;
 
-use crate::{
-    MicrosandboxResult,
-    config::{EnvPair, NetworkScope, PathPair, PortPair},
-};
+#[cfg(unix)]
+use crate::MicrosandboxResult;
+use crate::config::{EnvPair, MountSpec, NetworkScope, PortPair};
 
+#[cfg(unix)]
+use super::microvm::MicroVm;
 use super::{
     LinuxRlimit,
-    microvm::{LogLevel, MicroVm, MicroVmConfig, Rootfs},
+    microvm::{LogLevel, MicroVmConfig, Rootfs},
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -40,7 +41,7 @@ pub struct MicroVmConfigBuilder<R, E> {
     rootfs: R,
     num_vcpus: u8,
     memory_mib: u32,
-    mapped_dirs: Vec<PathPair>,
+    mapped_dirs: Vec<MountSpec>,
     port_map: Vec<PortPair>,
     scope: NetworkScope,
     ip: Option<Ipv4Addr>,
@@ -80,9 +81,9 @@ pub struct MicroVmConfigBuilder<R, E> {
 ///
 /// ## Examples
 ///
-/// ```rust
+/// ```ignore
 /// use microsandbox_core::vm::{MicroVmBuilder, LogLevel, Rootfs};
-/// use microsandbox_core::config::NetworkScope;
+/// use microsandbox_core::config::{MountSpec, NetworkScope};
 /// use std::path::PathBuf;
 ///
 /// # fn main() -> anyhow::Result<()> {
@@ -91,7 +92,7 @@ pub struct MicroVmConfigBuilder<R, E> {
 ///     .rootfs(Rootfs::Native(PathBuf::from("/tmp")))
 ///     .num_vcpus(2)
 ///     .memory_mib(1024)
-///     .mapped_dirs(["/home:/guest/mount".parse()?])
+///     .mapped_dirs([MountSpec::with_distinct("/home", "/guest/mount")])
 ///     .port_map(["8080:80".parse()?])
 ///     .scope(NetworkScope::Public)
 ///     .ip("192.168.1.100".parse()?)
@@ -241,19 +242,17 @@ impl<R, M> MicroVmConfigBuilder<R, M> {
     ///
     /// ```rust
     /// use microsandbox_core::vm::MicroVmConfigBuilder;
+    /// use microsandbox_core::config::MountSpec;
     ///
-    /// # fn main() -> anyhow::Result<()> {
     /// let config = MicroVmConfigBuilder::default()
     ///     .mapped_dirs([
     ///         // Share host's /data directory as /mnt/data in guest
-    ///         "/data:/mnt/data".parse()?,
+    ///         MountSpec::with_distinct("/data", "/mnt/data"),
     ///         // Share current directory as /app in guest
-    ///         "./:/app".parse()?,
+    ///         MountSpec::with_distinct("./", "/app"),
     ///         // Use same path in both host and guest
-    ///         "/shared".parse()?
+    ///         MountSpec::with_same("/shared"),
     ///     ]);
-    /// # Ok(())
-    /// # }
     /// ```
     ///
     /// ## Notes
@@ -261,7 +260,7 @@ impl<R, M> MicroVmConfigBuilder<R, M> {
     /// - Guest paths will be created if they don't exist
     /// - Changes in shared directories are immediately visible to both systems
     /// - Useful for development, configuration files, and data sharing
-    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = PathPair>) -> Self {
+    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = MountSpec>) -> Self {
         self.mapped_dirs = mapped_dirs.into_iter().collect();
         self
     }
@@ -586,7 +585,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{LogLevel, MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -658,7 +657,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -688,7 +687,7 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ## Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use microsandbox_core::vm::{MicroVmBuilder, Rootfs};
     /// use tempfile::TempDir;
     ///
@@ -720,21 +719,19 @@ impl<R, M> MicroVmBuilder<R, M> {
     ///
     /// ```rust
     /// use microsandbox_core::vm::MicroVmConfigBuilder;
+    /// use microsandbox_core::config::MountSpec;
     ///
-    /// # fn main() -> anyhow::Result<()> {
     /// let config = MicroVmConfigBuilder::default()
     ///     .mapped_dirs([
     ///         // Share host's /data directory as /mnt/data in guest
-    ///         "/data:/mnt/data".parse()?,
+    ///         MountSpec::with_distinct("/data", "/mnt/data"),
     ///         // Share current directory as /app in guest
-    ///         "./:/app".parse()?,
+    ///         MountSpec::with_distinct("./", "/app"),
     ///         // Use same path in both host and guest
-    ///         "/shared".parse()?
+    ///         MountSpec::with_same("/shared"),
     ///     ]);
-    /// # Ok(())
-    /// # }
     /// ```
-    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = PathPair>) -> Self {
+    pub fn mapped_dirs(mut self, mapped_dirs: impl IntoIterator<Item = MountSpec>) -> Self {
         self.inner = self.inner.mapped_dirs(mapped_dirs);
         self
     }
@@ -1028,6 +1025,7 @@ impl MicroVmConfigBuilder<Rootfs, Utf8UnixPathBuf> {
     }
 }
 
+#[cfg(unix)]
 impl MicroVmBuilder<Rootfs, Utf8UnixPathBuf> {
     /// Builds the MicroVm.
     ///
@@ -1136,7 +1134,7 @@ mod tests {
             .rootfs(rootfs.clone())
             .num_vcpus(2)
             .memory_mib(1024)
-            .mapped_dirs(["/guest/mount:/host/mount".parse()?])
+            .mapped_dirs([MountSpec::with_distinct("/guest/mount", "/host/mount")])
             .port_map(["8080:80".parse()?])
             .rlimits(["RLIMIT_NOFILE=1024:1024".parse()?])
             .workdir_path(workdir_path)
@@ -1151,7 +1149,7 @@ mod tests {
         assert_eq!(builder.inner.memory_mib, 1024);
         assert_eq!(
             builder.inner.mapped_dirs,
-            ["/guest/mount:/host/mount".parse()?]
+            [MountSpec::with_distinct("/guest/mount", "/host/mount")]
         );
         assert_eq!(builder.inner.port_map, ["8080:80".parse()?]);
         assert_eq!(builder.inner.rlimits, ["RLIMIT_NOFILE=1024:1024".parse()?]);

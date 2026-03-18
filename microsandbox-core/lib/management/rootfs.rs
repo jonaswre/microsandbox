@@ -6,14 +6,17 @@
 
 use std::{
     collections::HashMap,
-    fs::Permissions,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use tokio::fs;
 
-use crate::{MicrosandboxResult, config::PathPair, vm::VIRTIOFS_TAG_PREFIX};
+use crate::{MicrosandboxResult, config::MountSpec, vm::VIRTIOFS_TAG_PREFIX};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -26,10 +29,12 @@ pub const OPAQUE_WHITEOUT_MARKER: &str = ".wh..wh..opq";
 pub const WHITEOUT_PREFIX: &str = ".wh.";
 
 // The xattr name to set
+#[cfg(unix)]
 const XATTR_OVERRIDE_STATS_NAME: &str = "user.containers.override_stat";
 
 // The value in the format "uid:gid:mode" (0:0:040755 means root:root directory with rwxr-xr-x permissions)
 // 040000 is S_IFDIR (directory file type), 0755 are the permissions
+#[cfg(unix)]
 const XATTR_OVERRIDE_STATS_VALUE: &str = "0:0:040755";
 
 //--------------------------------------------------------------------------------------------------
@@ -78,12 +83,14 @@ pub async fn patch_with_sandbox_scripts(
         fs::write(&script_path, full_content).await?;
 
         // Make executable for user and group (rwxr-x---)
+        #[cfg(unix)]
         fs::set_permissions(&script_path, Permissions::from_mode(0o750)).await?;
     }
 
     // Create shell script containing just the shell path
     let shell_script_path = scripts_dir.join("shell");
     fs::write(&shell_script_path, shell_path.to_string()).await?;
+    #[cfg(unix)]
     fs::set_permissions(&shell_script_path, Permissions::from_mode(0o750)).await?;
 
     Ok(())
@@ -116,7 +123,7 @@ pub async fn patch_with_sandbox_scripts(
 /// - Cannot set permissions on the fstab file
 pub async fn patch_with_virtiofs_mounts(
     root_path: &Path,
-    mapped_dirs: &[PathPair],
+    mapped_dirs: &[MountSpec],
 ) -> MicrosandboxResult<()> {
     let fstab_path = root_path.join("etc/fstab");
 
@@ -164,10 +171,13 @@ pub async fn patch_with_virtiofs_mounts(
     fs::write(&fstab_path, fstab_content).await?;
 
     // Set proper permissions (644 - rw-r--r--)
-    let perms = fs::metadata(&fstab_path).await?.permissions();
-    let mut new_perms = perms;
-    new_perms.set_mode(0o644);
-    fs::set_permissions(&fstab_path, new_perms).await?;
+    #[cfg(unix)]
+    {
+        let perms = fs::metadata(&fstab_path).await?.permissions();
+        let mut new_perms = perms;
+        new_perms.set_mode(0o644);
+        fs::set_permissions(&fstab_path, new_perms).await?;
+    }
 
     Ok(())
 }
@@ -237,10 +247,13 @@ async fn _patch_with_hostnames(
     fs::write(&hosts_path, hosts_content).await?;
 
     // Set proper permissions (644 - rw-r--r--)
-    let perms = fs::metadata(&hosts_path).await?.permissions();
-    let mut new_perms = perms;
-    new_perms.set_mode(0o644);
-    fs::set_permissions(&hosts_path, new_perms).await?;
+    #[cfg(unix)]
+    {
+        let perms = fs::metadata(&hosts_path).await?.permissions();
+        let mut new_perms = perms;
+        new_perms.set_mode(0o644);
+        fs::set_permissions(&hosts_path, new_perms).await?;
+    }
 
     Ok(())
 }
@@ -312,10 +325,13 @@ pub async fn patch_with_default_dns_settings(root_paths: &[PathBuf]) -> Microsan
         fs::write(&resolv_path, resolv_content).await?;
 
         // Set proper permissions (644 - rw-r--r--)
-        let perms = fs::metadata(&resolv_path).await?.permissions();
-        let mut new_perms = perms;
-        new_perms.set_mode(0o644);
-        fs::set_permissions(&resolv_path, new_perms).await?;
+        #[cfg(unix)]
+        {
+            let perms = fs::metadata(&resolv_path).await?.permissions();
+            let mut new_perms = perms;
+            new_perms.set_mode(0o644);
+            fs::set_permissions(&resolv_path, new_perms).await?;
+        }
     }
 
     Ok(())
@@ -333,6 +349,7 @@ pub async fn patch_with_default_dns_settings(root_paths: &[PathBuf]) -> Microsan
 /// ## Errors
 /// Returns an error if:
 /// - Cannot set the extended attribute
+#[cfg(unix)]
 pub async fn patch_with_stat_override(root_path: &Path) -> MicrosandboxResult<()> {
     // Convert path to CString for xattr crate
     let path_str = root_path.to_str().ok_or_else(|| {
@@ -363,12 +380,20 @@ pub async fn patch_with_stat_override(root_path: &Path) -> MicrosandboxResult<()
     }
 }
 
+/// No-op version of `patch_with_stat_override` for non-Unix platforms.
+#[cfg(not(unix))]
+pub async fn patch_with_stat_override(_root_path: &Path) -> MicrosandboxResult<()> {
+    Ok(())
+}
+
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use tempfile::TempDir;
 
     use crate::MicrosandboxError;
@@ -394,9 +419,9 @@ mod tests {
 
         // Create test directory mappings using our temporary paths
         let mapped_dirs = vec![
-            format!("{}:/container/data", host_data.display()).parse::<PathPair>()?,
-            format!("{}:/etc/app/config", host_config.display()).parse::<PathPair>()?,
-            format!("{}:/app", host_app.display()).parse::<PathPair>()?,
+            format!("{}:/container/data", host_data.display()).parse::<MountSpec>()?,
+            format!("{}:/etc/app/config", host_config.display()).parse::<MountSpec>()?,
+            format!("{}:/app", host_app.display()).parse::<MountSpec>()?,
         ];
 
         // Update fstab
@@ -434,8 +459,8 @@ mod tests {
         fs::create_dir_all(&host_logs).await?;
 
         let new_mapped_dirs = vec![
-            format!("{}:/container/data", host_data.display()).parse::<PathPair>()?, // Keep one existing
-            format!("{}:/var/log", host_logs.display()).parse::<PathPair>()?,        // Add new one
+            format!("{}:/container/data", host_data.display()).parse::<MountSpec>()?, // Keep one existing
+            format!("{}:/var/log", host_logs.display()).parse::<MountSpec>()?,        // Add new one
         ];
 
         // Update fstab again
@@ -481,7 +506,7 @@ mod tests {
         fs::create_dir_all(&host_path).await?;
 
         let mapped_dirs =
-            vec![format!("{}:/container/data", host_path.display()).parse::<PathPair>()?];
+            vec![format!("{}:/container/data", host_path.display()).parse::<MountSpec>()?];
 
         // Function should detect it cannot write to /etc/fstab and return an error
         let result = patch_with_virtiofs_mounts(readonly_path, &mapped_dirs).await;

@@ -34,6 +34,7 @@ pub enum MicrosandboxUtilsError {
     Runtime(String),
 
     /// An error that occurred during a nix operation
+    #[cfg(unix)]
     #[error("nix error: {0}")]
     NixError(#[from] nix::Error),
 

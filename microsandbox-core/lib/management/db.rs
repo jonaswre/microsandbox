@@ -13,14 +13,32 @@ use oci_client::{
     manifest::{OciDescriptor, OciImageManifest},
 };
 use oci_spec::image::MediaType;
-use sqlx::{Pool, Row, Sqlite, migrate::Migrator, sqlite::SqlitePoolOptions};
+use sqlx::{
+    Pool, Row, Sqlite,
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use tokio::fs;
 
 use crate::{
     MicrosandboxResult,
     models::{Config, Image, Layer, Manifest, Sandbox},
-    runtime::SANDBOX_STATUS_RUNNING,
 };
+
+/// The status string for a running sandbox.
+/// Duplicated here to avoid depending on the unix-gated `runtime` module.
+const SANDBOX_STATUS_RUNNING: &str = "RUNNING";
+
+/// Creates SQLite connect options for a database path.
+///
+/// Uses `SqliteConnectOptions` directly instead of URL parsing to avoid
+/// issues with Windows drive letters (e.g. `C:`) being misinterpreted
+/// as URL components.
+fn sqlite_options(path: &Path) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+}
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -61,7 +79,7 @@ pub async fn initialize(
     // Create database connection pool
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+        .connect_with(sqlite_options(db_path))
         .await?;
 
     // Run migrations
@@ -79,7 +97,7 @@ pub async fn get_pool(db_path: impl AsRef<Path>) -> MicrosandboxResult<Pool<Sqli
     let db_path = db_path.as_ref();
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+        .connect_with(sqlite_options(db_path))
         .await?;
 
     Ok(pool)
@@ -121,19 +139,6 @@ pub(crate) async fn save_or_update_sandbox(
     microvm_pid: u32,
     rootfs_paths: &str,
 ) -> MicrosandboxResult<i64> {
-    let sandbox = Sandbox {
-        id: 0,
-        name: name.to_string(),
-        config_file: config_file.to_string(),
-        config_last_modified: *config_last_modified,
-        status: status.to_string(),
-        supervisor_pid,
-        microvm_pid,
-        rootfs_paths: rootfs_paths.to_string(),
-        created_at: Utc::now(),
-        modified_at: Utc::now(),
-    };
-
     // Try to update first
     let update_result = sqlx::query(
         r#"
@@ -143,18 +148,22 @@ pub(crate) async fn save_or_update_sandbox(
             supervisor_pid = ?,
             microvm_pid = ?,
             rootfs_paths = ?,
+            backend_kind = ?,
+            runtime_id = ?,
             modified_at = CURRENT_TIMESTAMP
         WHERE name = ? AND config_file = ?
         RETURNING id
         "#,
     )
-    .bind(sandbox.config_last_modified.to_rfc3339())
-    .bind(&sandbox.status)
-    .bind(sandbox.supervisor_pid)
-    .bind(sandbox.microvm_pid)
-    .bind(&sandbox.rootfs_paths)
-    .bind(&sandbox.name)
-    .bind(&sandbox.config_file)
+    .bind(config_last_modified.to_rfc3339())
+    .bind(status)
+    .bind(supervisor_pid)
+    .bind(microvm_pid)
+    .bind(rootfs_paths)
+    .bind("unix_krun")
+    .bind(format!("krun-{}", supervisor_pid))
+    .bind(name)
+    .bind(config_file)
     .fetch_optional(pool)
     .await?;
 
@@ -168,19 +177,101 @@ pub(crate) async fn save_or_update_sandbox(
             r#"
             INSERT INTO sandboxes (
                 name, config_file, config_last_modified,
-                status, supervisor_pid, microvm_pid, rootfs_paths
+                status, supervisor_pid, microvm_pid, rootfs_paths,
+                backend_kind, runtime_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             "#,
         )
-        .bind(sandbox.name)
-        .bind(sandbox.config_file)
-        .bind(sandbox.config_last_modified.to_rfc3339())
-        .bind(sandbox.status)
-        .bind(sandbox.supervisor_pid)
-        .bind(sandbox.microvm_pid)
-        .bind(sandbox.rootfs_paths)
+        .bind(name)
+        .bind(config_file)
+        .bind(config_last_modified.to_rfc3339())
+        .bind(status)
+        .bind(supervisor_pid)
+        .bind(microvm_pid)
+        .bind(rootfs_paths)
+        .bind("unix_krun")
+        .bind(format!("krun-{}", supervisor_pid))
+        .fetch_one(pool)
+        .await?;
+
+        Ok(record.get::<i64, _>("id"))
+    }
+}
+
+/// Saves or updates a sandbox record with full backend-aware fields.
+///
+/// This variant stores `RuntimeHandle` fields (control_endpoint, backend_object_id, etc.)
+/// and is used by the Windows HCS backend path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_or_update_sandbox_runtime(
+    pool: &Pool<Sqlite>,
+    name: &str,
+    config_file: &str,
+    config_last_modified: &DateTime<Utc>,
+    status: &str,
+    worker_pid: u32,
+    backend_kind: &str,
+    runtime_id: &str,
+    control_endpoint: &str,
+    backend_object_id: &str,
+) -> MicrosandboxResult<i64> {
+    // Try to update first
+    let update_result = sqlx::query(
+        r#"
+        UPDATE sandboxes
+        SET config_last_modified = ?,
+            status = ?,
+            supervisor_pid = ?,
+            microvm_pid = 0,
+            rootfs_paths = '',
+            backend_kind = ?,
+            runtime_id = ?,
+            control_endpoint = ?,
+            backend_object_id = ?,
+            modified_at = CURRENT_TIMESTAMP
+        WHERE name = ? AND config_file = ?
+        RETURNING id
+        "#,
+    )
+    .bind(config_last_modified.to_rfc3339())
+    .bind(status)
+    .bind(worker_pid)
+    .bind(backend_kind)
+    .bind(runtime_id)
+    .bind(control_endpoint)
+    .bind(backend_object_id)
+    .bind(name)
+    .bind(config_file)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(record) = update_result {
+        tracing::debug!("updated existing sandbox record (runtime)");
+        Ok(record.get::<i64, _>("id"))
+    } else {
+        tracing::debug!("creating new sandbox record (runtime)");
+        let record = sqlx::query(
+            r#"
+            INSERT INTO sandboxes (
+                name, config_file, config_last_modified,
+                status, supervisor_pid, microvm_pid, rootfs_paths,
+                backend_kind, runtime_id, control_endpoint, backend_object_id
+            )
+            VALUES (?, ?, ?, ?, ?, 0, '', ?, ?, ?, ?)
+            RETURNING id
+            "#,
+        )
+        .bind(name)
+        .bind(config_file)
+        .bind(config_last_modified.to_rfc3339())
+        .bind(status)
+        .bind(worker_pid)
+        .bind(backend_kind)
+        .bind(runtime_id)
+        .bind(control_endpoint)
+        .bind(backend_object_id)
         .fetch_one(pool)
         .await?;
 
@@ -197,6 +288,8 @@ pub(crate) async fn get_sandbox(
         r#"
         SELECT id, name, config_file, config_last_modified, status,
                supervisor_pid, microvm_pid, rootfs_paths,
+               backend_kind, runtime_id, control_endpoint,
+               backend_object_id, rootfs_descriptor_json, backend_state_json,
                created_at, modified_at
         FROM sandboxes
         WHERE name = ? AND config_file = ?
@@ -207,21 +300,7 @@ pub(crate) async fn get_sandbox(
     .fetch_optional(pool)
     .await?;
 
-    Ok(record.map(|row| Sandbox {
-        id: row.get("id"),
-        name: row.get("name"),
-        config_file: row.get("config_file"),
-        config_last_modified: row
-            .get::<String, _>("config_last_modified")
-            .parse::<DateTime<Utc>>()
-            .unwrap(),
-        status: row.get("status"),
-        supervisor_pid: row.get("supervisor_pid"),
-        microvm_pid: row.get("microvm_pid"),
-        rootfs_paths: row.get("rootfs_paths"),
-        created_at: parse_sqlite_datetime(&row.get::<String, _>("created_at")),
-        modified_at: parse_sqlite_datetime(&row.get::<String, _>("modified_at")),
-    }))
+    Ok(record.map(|row| sandbox_from_row(&row)))
 }
 
 /// Updates the status of a sandbox identified by name and config file
@@ -257,6 +336,8 @@ pub(crate) async fn get_running_config_sandboxes(
         r#"
         SELECT id, name, config_file, config_last_modified, status,
                supervisor_pid, microvm_pid, rootfs_paths,
+               backend_kind, runtime_id, control_endpoint,
+               backend_object_id, rootfs_descriptor_json, backend_state_json,
                created_at, modified_at
         FROM sandboxes
         WHERE config_file = ? AND status = ?
@@ -268,24 +349,7 @@ pub(crate) async fn get_running_config_sandboxes(
     .fetch_all(pool)
     .await?;
 
-    Ok(records
-        .into_iter()
-        .map(|row| Sandbox {
-            id: row.get("id"),
-            name: row.get("name"),
-            config_file: row.get("config_file"),
-            config_last_modified: row
-                .get::<String, _>("config_last_modified")
-                .parse::<DateTime<Utc>>()
-                .unwrap(),
-            status: row.get("status"),
-            supervisor_pid: row.get("supervisor_pid"),
-            microvm_pid: row.get("microvm_pid"),
-            rootfs_paths: row.get("rootfs_paths"),
-            created_at: parse_sqlite_datetime(&row.get::<String, _>("created_at")),
-            modified_at: parse_sqlite_datetime(&row.get::<String, _>("modified_at")),
-        })
-        .collect())
+    Ok(records.iter().map(sandbox_from_row).collect())
 }
 
 /// Deletes a sandbox from the database by name and config file.
@@ -933,6 +997,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sandbox_db_has_backend_neutral_columns() -> MicrosandboxResult<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("test_sandbox_columns.db");
+
+        let pool = initialize(&db_path, &SANDBOX_DB_MIGRATOR).await?;
+
+        // Verify the new columns exist by inserting a record with them
+        sqlx::query(
+            r#"
+            INSERT INTO sandboxes (
+                name, config_file, config_last_modified,
+                status, supervisor_pid, microvm_pid, rootfs_paths,
+                backend_kind, runtime_id, control_endpoint,
+                backend_object_id, rootfs_descriptor_json, backend_state_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("test")
+        .bind("Sandboxfile")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("RUNNING")
+        .bind(1234_u32)
+        .bind(5678_u32)
+        .bind("overlayfs:/a:/b")
+        .bind("unix_krun")
+        .bind("krun-1234")
+        .bind("")
+        .bind("")
+        .bind("{}")
+        .bind("{}")
+        .execute(&pool)
+        .await?;
+
+        // Read it back and verify
+        let sandbox = get_sandbox(&pool, "test", "Sandboxfile").await?.unwrap();
+        assert_eq!(sandbox.backend_kind, "unix_krun");
+        assert_eq!(sandbox.runtime_id, "krun-1234");
+        assert_eq!(sandbox.control_endpoint, "");
+        assert_eq!(sandbox.backend_object_id, "");
+        assert_eq!(sandbox.rootfs_descriptor_json, "{}");
+        assert_eq!(sandbox.backend_state_json, "{}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_init_oci_db() -> MicrosandboxResult<()> {
         // Create temporary directory
         let temp_dir = tempdir()?;
@@ -978,6 +1088,31 @@ mod tests {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
+
+/// Constructs a `Sandbox` from a database row containing all columns including backend-neutral fields.
+fn sandbox_from_row(row: &sqlx::sqlite::SqliteRow) -> Sandbox {
+    Sandbox {
+        id: row.get("id"),
+        name: row.get("name"),
+        config_file: row.get("config_file"),
+        config_last_modified: row
+            .get::<String, _>("config_last_modified")
+            .parse::<DateTime<Utc>>()
+            .unwrap(),
+        status: row.get("status"),
+        supervisor_pid: row.get("supervisor_pid"),
+        microvm_pid: row.get("microvm_pid"),
+        rootfs_paths: row.get("rootfs_paths"),
+        backend_kind: row.get("backend_kind"),
+        runtime_id: row.get("runtime_id"),
+        control_endpoint: row.get("control_endpoint"),
+        backend_object_id: row.get("backend_object_id"),
+        rootfs_descriptor_json: row.get("rootfs_descriptor_json"),
+        backend_state_json: row.get("backend_state_json"),
+        created_at: parse_sqlite_datetime(&row.get::<String, _>("created_at")),
+        modified_at: parse_sqlite_datetime(&row.get::<String, _>("modified_at")),
+    }
+}
 
 /// Parses a SQLite datetime string (in "YYYY-MM-DD HH:MM:SS" format) to a DateTime<Utc>.
 fn parse_sqlite_datetime(s: &str) -> DateTime<Utc> {

@@ -132,16 +132,29 @@ impl Image {
         image: Reference,
         layer_extraction_dir: Option<PathBuf>,
     ) -> MicrosandboxResult<()> {
-        let temp_download_dir = tempdir()?;
-        let temp_download_dir = temp_download_dir.path().to_path_buf();
-        tracing::info!(?temp_download_dir, "temporary download directory");
-
         let microsandbox_home_path = env::get_microsandbox_home_path();
         let db_path = microsandbox_home_path.join(OCI_DB_FILENAME);
         let db = db::get_or_create_pool(&db_path, &db::OCI_DB_MIGRATOR).await?;
         let layer_output_dir = layer_extraction_dir
             .unwrap_or_else(|| env::get_microsandbox_home_path().join(LAYERS_SUBDIR));
-        let layer_cache = GlobalCache::new(temp_download_dir, layer_output_dir, db.clone()).await?;
+
+        // On Windows, persist tarballs in the layers dir (they're used directly by tar2ext4).
+        // On Unix, use a temp dir since tarballs are only needed during extraction.
+        #[cfg(windows)]
+        let tar_download_dir = {
+            let dir = layer_output_dir.clone();
+            tokio::fs::create_dir_all(&dir).await?;
+            dir
+        };
+        #[cfg(unix)]
+        let _temp_dir = tempdir()?;
+        #[cfg(unix)]
+        let tar_download_dir = _temp_dir.path().to_path_buf();
+
+        tracing::info!(?tar_download_dir, "layer download directory");
+
+        let layer_cache =
+            GlobalCache::new(tar_download_dir, layer_output_dir, db.clone()).await?;
 
         // libkrun is based solely on Linux, so explicitly set the platform to Linux
         let mut platform = Platform::default();

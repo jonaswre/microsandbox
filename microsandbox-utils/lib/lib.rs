@@ -8,6 +8,7 @@ pub mod env;
 pub mod error;
 pub mod log;
 pub mod path;
+pub mod platform;
 pub mod runtime;
 pub mod seekable;
 pub mod term;
@@ -21,6 +22,7 @@ pub use env::*;
 pub use error::*;
 pub use log::*;
 pub use path::*;
+#[cfg(unix)]
 pub use runtime::*;
 pub use seekable::*;
 pub use term::*;

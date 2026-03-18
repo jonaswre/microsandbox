@@ -12,14 +12,18 @@
 
 use crate::{
     MicrosandboxError, MicrosandboxResult,
+    backend::VmBackend,
     config::{Microsandbox, START_SCRIPT_NAME},
 };
+#[cfg(windows)]
+use crate::backend::windows::{boot_bundle, WindowsHcsBackend, WindowsHcsConfig};
 
 #[cfg(feature = "cli")]
 use console::style;
 #[cfg(feature = "cli")]
 use microsandbox_utils::term;
 use microsandbox_utils::{MICROSANDBOX_ENV_DIR, SANDBOX_DB_FILENAME};
+#[cfg(unix)]
 use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
@@ -244,6 +248,7 @@ pub async fn apply(
     for sandbox in running_sandboxes {
         if !config_sandboxes.contains_key(&sandbox.name) {
             tracing::info!("stopping sandbox: {}", sandbox.name);
+            #[cfg(unix)]
             if let Err(e) = signal::kill(
                 Pid::from_raw(sandbox.supervisor_pid as i32),
                 Signal::SIGTERM,
@@ -386,7 +391,8 @@ pub async fn up(
 
     if detach {
         // Start specified sandboxes in detached mode
-        for name in sandboxes_to_start {
+        #[cfg(unix)]
+        for name in &sandboxes_to_start {
             tracing::info!("starting sandbox: {}", name);
             sandbox::run(
                 name,
@@ -400,33 +406,148 @@ pub async fn up(
             )
             .await?
         }
+
+        #[cfg(windows)]
+        {
+            let backend = match create_windows_backend().await {
+                Ok(b) => b,
+                Err(e) => {
+                    #[cfg(feature = "cli")]
+                    term::finish_with_error(&start_sandboxes_sp);
+                    return Err(e);
+                }
+            };
+
+            // Get config last modified timestamp for DB records.
+            let config_path = canonical_project_dir.join(&config_file);
+            let config_last_modified: chrono::DateTime<chrono::Utc> =
+                tokio::fs::metadata(&config_path).await?.modified()?.into();
+
+            for name in &sandboxes_to_start {
+                tracing::info!("starting sandbox via Windows HCS backend: {}", name);
+                let handle = match start_sandbox_with_backend(
+                    name,
+                    Some(&canonical_project_dir),
+                    Some(&config_file),
+                    &backend,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        #[cfg(feature = "cli")]
+                        term::finish_with_error(&start_sandboxes_sp);
+                        return Err(e);
+                    }
+                };
+
+                // Persist the runtime handle to the sandbox database.
+                if let Err(e) = db::save_or_update_sandbox_runtime(
+                    &pool,
+                    name,
+                    &config_file,
+                    &config_last_modified,
+                    "RUNNING",
+                    handle.worker_pid,
+                    &handle.backend_kind.to_string(),
+                    &handle.runtime_id,
+                    &handle.control_endpoint,
+                    &handle.backend_object_id,
+                )
+                .await
+                {
+                    #[cfg(feature = "cli")]
+                    term::finish_with_error(&start_sandboxes_sp);
+                    return Err(e);
+                }
+            }
+        }
     } else {
         // Start sandboxes in non-detached mode with multiplexed output
-        let sandbox_commands = match prepare_sandbox_commands(
-            &sandboxes_to_start,
-            None, // Start script is None for normal up
-            &canonical_project_dir,
-            &config_file,
-        )
-        .await
+        #[cfg(unix)]
         {
-            Ok(commands) => commands,
-            Err(e) => {
+            let sandbox_commands = match prepare_sandbox_commands(
+                &sandboxes_to_start,
+                None, // Start script is None for normal up
+                &canonical_project_dir,
+                &config_file,
+            )
+            .await
+            {
+                Ok(commands) => commands,
+                Err(e) => {
+                    #[cfg(feature = "cli")]
+                    term::finish_with_error(&start_sandboxes_sp);
+                    return Err(e);
+                }
+            };
+
+            if !sandbox_commands.is_empty() {
+                // Finish the spinner before running commands with output
                 #[cfg(feature = "cli")]
-                term::finish_with_error(&start_sandboxes_sp);
-                return Err(e);
+                start_sandboxes_sp.finish();
+
+                run_commands_with_prefixed_output(sandbox_commands).await?;
+
+                // Return early as we've already finished the spinner
+                return Ok(());
             }
-        };
+        }
 
-        if !sandbox_commands.is_empty() {
-            // Finish the spinner before running commands with output
-            #[cfg(feature = "cli")]
-            start_sandboxes_sp.finish();
+        #[cfg(windows)]
+        {
+            // On Windows, non-detached mode also uses the backend path.
+            // The worker process runs in the foreground (output visible via logging).
+            let backend = match create_windows_backend().await {
+                Ok(b) => b,
+                Err(e) => {
+                    #[cfg(feature = "cli")]
+                    term::finish_with_error(&start_sandboxes_sp);
+                    return Err(e);
+                }
+            };
 
-            run_commands_with_prefixed_output(sandbox_commands).await?;
+            let config_path = canonical_project_dir.join(&config_file);
+            let config_last_modified: chrono::DateTime<chrono::Utc> =
+                tokio::fs::metadata(&config_path).await?.modified()?.into();
 
-            // Return early as we've already finished the spinner
-            return Ok(());
+            for name in &sandboxes_to_start {
+                tracing::info!("starting sandbox via Windows HCS backend: {}", name);
+                let handle = match start_sandbox_with_backend(
+                    name,
+                    Some(&canonical_project_dir),
+                    Some(&config_file),
+                    &backend,
+                )
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        #[cfg(feature = "cli")]
+                        term::finish_with_error(&start_sandboxes_sp);
+                        return Err(e);
+                    }
+                };
+
+                if let Err(e) = db::save_or_update_sandbox_runtime(
+                    &pool,
+                    name,
+                    &config_file,
+                    &config_last_modified,
+                    "RUNNING",
+                    handle.worker_pid,
+                    &handle.backend_kind.to_string(),
+                    &handle.runtime_id,
+                    &handle.control_endpoint,
+                    &handle.backend_object_id,
+                )
+                .await
+                {
+                    #[cfg(feature = "cli")]
+                    term::finish_with_error(&start_sandboxes_sp);
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -434,6 +555,72 @@ pub async fn up(
     start_sandboxes_sp.finish();
 
     Ok(())
+}
+
+/// Starts a single sandbox using the backend-neutral `VmBackend` trait.
+///
+/// This function resolves the sandbox config into a `ResolvedSandboxSpec` and passes
+/// it to the provided backend for execution. Returns the `RuntimeHandle` for the
+/// started sandbox.
+pub async fn start_sandbox_with_backend(
+    sandbox_name: &str,
+    project_dir: Option<&Path>,
+    config_file: Option<&str>,
+    backend: &dyn VmBackend,
+) -> MicrosandboxResult<crate::backend::RuntimeHandle> {
+    let spec = sandbox::resolve_sandbox_spec(
+        sandbox_name,
+        None, // script_name
+        project_dir,
+        config_file,
+        vec![], // args
+        None,   // exec
+        true,   // use_image_defaults
+    )
+    .await?;
+
+    let handle = backend.start(&spec).await?;
+    tracing::info!(
+        "started sandbox '{}' via backend {:?} (PID: {})",
+        sandbox_name,
+        handle.backend_kind,
+        handle.worker_pid
+    );
+    Ok(handle)
+}
+
+/// Creates a `WindowsHcsBackend` by resolving platform paths and loading the boot bundle.
+#[cfg(windows)]
+async fn create_windows_backend() -> MicrosandboxResult<WindowsHcsBackend> {
+    use microsandbox_utils::platform::platform_paths;
+
+    let paths = platform_paths();
+    let runtime_dir = paths.runtime_home();
+    let cache_dir = paths.cache_home();
+
+    // Load the boot bundle (must be pre-installed).
+    let bundle = boot_bundle::ensure_bundle(&runtime_dir, "0.2.6").await?;
+
+    // Resolve the worker binary path — look next to the current executable.
+    let current_exe = std::env::current_exe().map_err(|e| {
+        MicrosandboxError::SupervisorBinaryNotFound(format!(
+            "Failed to determine current executable path: {}",
+            e
+        ))
+    })?;
+    let worker_path = current_exe
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("msbrun-hcs.exe");
+
+    let config = WindowsHcsConfig {
+        boot_bundle_dir: bundle.dir.clone(),
+        worker_path,
+        cache_dir,
+        runtime_dir,
+    };
+
+    Ok(WindowsHcsBackend::new(config))
 }
 
 /// Stops specified sandboxes that are both in the configuration and currently running.
@@ -540,11 +727,12 @@ pub async fn down(
     };
 
     // Stop specified sandboxes that are both in config and running
-    for sandbox in running_sandboxes {
+    for sandbox in &running_sandboxes {
         if sandbox_names_to_stop.contains(&sandbox.name)
             && config_sandboxes.contains_key(&sandbox.name)
         {
             tracing::info!("stopping sandbox: {}", sandbox.name);
+            #[cfg(unix)]
             if let Err(e) = signal::kill(
                 Pid::from_raw(sandbox.supervisor_pid as i32),
                 Signal::SIGTERM,
@@ -552,6 +740,58 @@ pub async fn down(
                 #[cfg(feature = "cli")]
                 term::finish_with_error(&stop_sandboxes_sp);
                 return Err(e.into());
+            }
+
+            #[cfg(windows)]
+            {
+                let pid = sandbox.supervisor_pid;
+                if pid > 0 {
+                    let output = tokio::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .output()
+                        .await;
+
+                    match output {
+                        Ok(o) if o.status.success() => {
+                            tracing::info!(
+                                sandbox = %sandbox.name,
+                                pid = pid,
+                                "Terminated sandbox worker process"
+                            );
+                        }
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            tracing::debug!(
+                                sandbox = %sandbox.name,
+                                "taskkill output: {}",
+                                stderr
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                sandbox = %sandbox.name,
+                                "Failed to run taskkill: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Update DB status to stopped.
+                if let Err(e) = db::update_sandbox_status(
+                    &pool,
+                    &sandbox.name,
+                    &config_file,
+                    "STOPPED",
+                )
+                .await
+                {
+                    tracing::warn!(
+                        sandbox = %sandbox.name,
+                        "Failed to update sandbox status in DB: {}",
+                        e
+                    );
+                }
             }
         }
     }
@@ -687,6 +927,7 @@ pub async fn status(
                 sandbox_status.rootfs_paths = Some(sandbox.rootfs_paths.clone());
 
                 // Get CPU and memory usage for the microVM process
+                #[cfg(unix)]
                 if let Ok(mut process) = psutil::process::Process::new(sandbox.microvm_pid) {
                     // CPU usage
                     if let Ok(cpu_percent) = process.cpu_percent() {

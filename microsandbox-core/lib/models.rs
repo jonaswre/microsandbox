@@ -33,6 +33,24 @@ pub struct Sandbox {
     /// The paths to the root filesystems for the sandbox.
     pub rootfs_paths: String,
 
+    /// The backend kind (e.g. "unix_krun", "windows_hcs").
+    pub backend_kind: String,
+
+    /// A unique runtime ID for this invocation.
+    pub runtime_id: String,
+
+    /// Control endpoint (empty on Unix; named pipe path on Windows).
+    pub control_endpoint: String,
+
+    /// Backend-specific object ID (empty on Unix; HCS compute system ID on Windows).
+    pub backend_object_id: String,
+
+    /// JSON describing the materialized rootfs.
+    pub rootfs_descriptor_json: String,
+
+    /// JSON blob for backend-specific state.
+    pub backend_state_json: String,
+
     /// When the sandbox was created
     pub created_at: DateTime<Utc>,
 

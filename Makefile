@@ -57,7 +57,7 @@ endif
 # -----------------------------------------------------------------------------
 # Phony Targets Declaration
 # -----------------------------------------------------------------------------
-.PHONY: all build install clean build_libkrun example bench bin _run_example _run_bench _run_bin help uninstall microsandbox _build_aliases
+.PHONY: all build install clean build_libkrun example bench bin _run_example _run_bench _run_bin help uninstall microsandbox _build_aliases build_hcs_worker build_bootstrap build_portal_linux build_rootfs build_bundle_windows
 
 # -----------------------------------------------------------------------------
 # Main Targets
@@ -162,6 +162,36 @@ uninstall:
 
 build_libkrun:
 	./scripts/build_libkrun.sh --no-clean --build-dir "$(BUILD_DIR)"
+
+# Build the Windows HCS worker binary (Go)
+build_hcs_worker:
+	cd microsandbox-hcs-worker && go build -buildvcs=false -o ../$(CARGO_TARGET_DIR)/msbrun-hcs.exe .
+	@echo "msbrun-hcs.exe built to $(CARGO_TARGET_DIR)/"
+
+# Cross-compile the bootstrap init binary for Linux (requires cross + Docker)
+BOOTSTRAP_TARGET := x86_64-unknown-linux-musl
+build_bootstrap:
+	cross build --release --target $(BOOTSTRAP_TARGET) --manifest-path microsandbox-bootstrap/Cargo.toml
+	@echo "bootstrap built to microsandbox-bootstrap/target/$(BOOTSTRAP_TARGET)/release/bootstrap"
+
+# Cross-compile the portal binary for Linux (requires cross + Docker)
+build_portal_linux:
+	cross build --release --target $(BOOTSTRAP_TARGET) -p microsandbox-portal --bin portal
+	@echo "portal built to target/$(BOOTSTRAP_TARGET)/release/portal"
+
+# Build the rootfs VHD for the boot bundle (requires tar2ext4, run in Linux/WSL)
+BOOT_BUNDLE_DIR := $(CARGO_TARGET_DIR)/boot-bundle
+build_rootfs: build_bootstrap
+	@mkdir -p $(BOOT_BUNDLE_DIR)
+	./scripts/build_rootfs_vhd.sh \
+		microsandbox-bootstrap/target/$(BOOTSTRAP_TARGET)/release/bootstrap \
+		target/$(BOOTSTRAP_TARGET)/release/portal \
+		$(BOOT_BUNDLE_DIR)/tar2ext4.exe \
+		$(BOOT_BUNDLE_DIR)/rootfs.vhd
+
+# Build the complete Windows boot bundle via PowerShell (requires cargo-zigbuild, python3, tar2ext4.exe)
+build_bundle_windows:
+	powershell -ExecutionPolicy Bypass -File scripts/Build-BootBundle.ps1
 
 # Catch-all target to allow example names and arguments
 %:

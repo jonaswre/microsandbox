@@ -46,6 +46,7 @@ mod error;
 // Exports
 //--------------------------------------------------------------------------------------------------
 
+pub mod backend;
 pub mod config;
 pub mod management;
 pub mod models;
