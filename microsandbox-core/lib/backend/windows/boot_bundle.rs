@@ -3,13 +3,23 @@
 //! The boot bundle contains all files needed to boot a Linux utility VM:
 //! kernel, rootfs VHD, bootstrap binary, portal binary, and manifest.
 //! The layout is fixed and versioned.
+//!
+//! When the bundle is not present locally, `ensure_bundle()` will attempt
+//! to download it from GitHub releases automatically.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::{MicrosandboxError, MicrosandboxResult};
+
+#[cfg(feature = "cli")]
+use indicatif::{ProgressBar, ProgressStyle};
+#[cfg(feature = "cli")]
+use microsandbox_utils::term::MULTI_PROGRESS;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -25,6 +35,12 @@ const BOOTSTRAP_FILENAME: &str = "bootstrap";
 const PORTAL_FILENAME: &str = "portal";
 const MANIFEST_FILENAME: &str = "manifest.json";
 const TAR2EXT4_FILENAME: &str = "tar2ext4.exe";
+
+/// GitHub release URL template for boot bundle zips.
+const BUNDLE_URL_TEMPLATE: &str = "https://github.com/microsandbox/microsandbox/releases/download/microsandbox-v{version}/microsandbox-boot-bundle-{version}-windows-x86_64.zip";
+
+/// Suffix for SHA256 checksum sidecar files.
+const SHA256_SUFFIX: &str = ".sha256";
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -150,10 +166,11 @@ pub async fn load_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResul
     Ok(BootBundle { dir, manifest })
 }
 
-/// Loads an existing boot bundle or returns an error with instructions.
+/// Loads an existing boot bundle, or downloads it from GitHub releases if missing.
 ///
 /// Attempts to load the boot bundle from the runtime directory.
-/// If not found, returns an error telling the user where to place the files.
+/// If not found, downloads the versioned zip from GitHub, verifies its SHA256,
+/// extracts it, and validates the result.
 pub async fn ensure_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResult<BootBundle> {
     match load_bundle(runtime_dir, version).await {
         Ok(bundle) => {
@@ -165,16 +182,165 @@ pub async fn ensure_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxRes
             Ok(bundle)
         }
         Err(_) => {
-            let expected_dir = bundle_dir(runtime_dir, version);
-            Err(MicrosandboxError::PathNotFound(format!(
-                "Boot bundle v{} not found at {}. \
-                 Please download the boot bundle and extract it to that directory. \
-                 Expected files: kernel, rootfs.vhd, bootstrap, portal, tar2ext4.exe, manifest.json",
-                version,
-                expected_dir.display()
-            )))
+            tracing::info!(version, "Boot bundle not found, downloading...");
+            download_bundle(runtime_dir, version).await
         }
     }
+}
+
+/// Downloads a boot bundle zip from GitHub releases, verifies its integrity,
+/// extracts it, and returns the validated bundle.
+async fn download_bundle(runtime_dir: &Path, version: &str) -> MicrosandboxResult<BootBundle> {
+    let dir = bundle_dir(runtime_dir, version);
+    fs::create_dir_all(&dir).await?;
+
+    let zip_url = BUNDLE_URL_TEMPLATE.replace("{version}", version);
+    let sha_url = format!("{}{}", &zip_url, SHA256_SUFFIX);
+    let zip_path = dir.join(format!(
+        "microsandbox-boot-bundle-{}-windows-x86_64.zip",
+        version
+    ));
+
+    // Step 1: Download the .sha256 sidecar.
+    tracing::info!(%sha_url, "Fetching checksum");
+    let sha_response = reqwest::get(&sha_url).await.map_err(|e| {
+        MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Failed to download boot bundle checksum from {}: {}",
+            sha_url, e
+        ))
+    })?;
+
+    if !sha_response.status().is_success() {
+        return Err(MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Boot bundle checksum not found at {} (HTTP {}). \
+             Ensure release microsandbox-v{} exists.",
+            sha_url,
+            sha_response.status(),
+            version
+        )));
+    }
+
+    let expected_hash = sha_response
+        .text()
+        .await
+        .map_err(|e| {
+            MicrosandboxError::ImageLayerDownloadFailed(format!(
+                "Failed to read checksum response: {}",
+                e
+            ))
+        })?
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+    if expected_hash.len() != 64 {
+        return Err(MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Invalid SHA256 checksum format from {}: '{}'",
+            sha_url, expected_hash
+        )));
+    }
+
+    // Step 2: Download the zip with streaming and optional progress bar.
+    tracing::info!(%zip_url, "Downloading boot bundle");
+    let zip_response = reqwest::get(&zip_url).await.map_err(|e| {
+        MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Failed to download boot bundle from {}: {}",
+            zip_url, e
+        ))
+    })?;
+
+    if !zip_response.status().is_success() {
+        return Err(MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Boot bundle not found at {} (HTTP {}). \
+             Ensure release microsandbox-v{} exists.",
+            zip_url,
+            zip_response.status(),
+            version
+        )));
+    }
+
+    #[cfg(feature = "cli")]
+    let progress_bar = {
+        let total_size = zip_response.content_length().unwrap_or(0);
+        let pb = MULTI_PROGRESS.add(ProgressBar::new(total_size));
+        let style = ProgressStyle::with_template(
+            "{spinner:.green} Downloading boot bundle {bar:40.green/green.dim} {bytes:.bold} / {total_bytes:.dim} ({eta})",
+        )
+        .unwrap()
+        .progress_chars("=+-");
+        pb.set_style(style);
+        pb
+    };
+
+    let mut file = fs::File::create(&zip_path).await?;
+    let mut hasher = Sha256::new();
+    let mut stream = zip_response.bytes_stream();
+
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| {
+            MicrosandboxError::ImageLayerDownloadFailed(format!(
+                "Error reading boot bundle download stream: {}",
+                e
+            ))
+        })?;
+        hasher.update(&bytes);
+        file.write_all(&bytes).await?;
+        #[cfg(feature = "cli")]
+        progress_bar.inc(bytes.len() as u64);
+    }
+    file.flush().await?;
+    drop(file);
+
+    #[cfg(feature = "cli")]
+    progress_bar.finish_and_clear();
+
+    // Step 3: Verify SHA256.
+    let actual_hash = hex::encode(hasher.finalize());
+    if actual_hash != expected_hash {
+        // Clean up the corrupt download.
+        let _ = fs::remove_file(&zip_path).await;
+        return Err(MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Boot bundle SHA256 mismatch: expected {}, got {}",
+            expected_hash, actual_hash
+        )));
+    }
+    tracing::info!("Boot bundle checksum verified");
+
+    // Step 4: Extract via PowerShell Expand-Archive.
+    tracing::info!(zip = %zip_path.display(), dest = %dir.display(), "Extracting boot bundle");
+    let ps_cmd = format!(
+        "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+        zip_path.display(),
+        dir.display()
+    );
+    let output = tokio::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Clean up.
+        let _ = fs::remove_file(&zip_path).await;
+        return Err(MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Failed to extract boot bundle zip: {}",
+            stderr.trim()
+        )));
+    }
+
+    // Clean up the zip file after successful extraction.
+    let _ = fs::remove_file(&zip_path).await;
+
+    // Step 5: Validate via load_bundle.
+    load_bundle(runtime_dir, version).await.map_err(|e| {
+        MicrosandboxError::ImageLayerDownloadFailed(format!(
+            "Downloaded boot bundle failed validation: {}",
+            e
+        ))
+    })
 }
 
 /// Checks if a boot bundle version is compatible with the current host version.
@@ -298,5 +464,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let result = load_bundle(temp.path(), "0.5.0").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_download_url_construction() {
+        let version = "0.2.6";
+        let url = BUNDLE_URL_TEMPLATE.replace("{version}", version);
+        assert_eq!(
+            url,
+            "https://github.com/microsandbox/microsandbox/releases/download/microsandbox-v0.2.6/microsandbox-boot-bundle-0.2.6-windows-x86_64.zip"
+        );
+        let sha_url = format!("{}{}", &url, SHA256_SUFFIX);
+        assert!(sha_url.ends_with(".zip.sha256"));
     }
 }

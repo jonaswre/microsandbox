@@ -20,4 +20,8 @@ pub struct SandboxSpec {
 pub struct GuestMountEntry {
     pub guest_path: String,
     pub readonly: bool,
+    /// Plan9 share tag for mounting via 9p. None if the mount point is
+    /// provided by other means (e.g., bind mount from SCSI VHD).
+    #[serde(default)]
+    pub tag: Option<String>,
 }

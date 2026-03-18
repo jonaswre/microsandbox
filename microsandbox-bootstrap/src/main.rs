@@ -32,6 +32,33 @@ use std::{fs, io, thread};
 use spec::SandboxSpec;
 
 //--------------------------------------------------------------------------------------------------
+// Vsock constants for 9p host directory sharing
+//--------------------------------------------------------------------------------------------------
+
+/// Linux address family for vsock.
+const AF_VSOCK: libc::c_int = 40;
+
+/// CID for the host (Hyper-V host).
+const VMADDR_CID_HOST: u32 = 2;
+
+/// Base vsock port for 9p mount shares (must match Go hcs.BaseMountPort).
+const P9_BASE_PORT: u32 = 50000;
+
+/// Number of vsock connection attempts before giving up.
+const VSOCK_CONNECT_RETRIES: u64 = 5;
+
+/// Linux sockaddr_vm structure for vsock connections.
+/// Layout matches the kernel's `struct sockaddr_vm` exactly.
+#[repr(C)]
+struct SockaddrVm {
+    svm_family: u16,
+    svm_reserved1: u16,
+    svm_port: u32,
+    svm_cid: u32,
+    svm_zero: [u8; 4],
+}
+
+//--------------------------------------------------------------------------------------------------
 // Entry point
 //--------------------------------------------------------------------------------------------------
 
@@ -51,13 +78,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     mount_essential_filesystems()?;
     mount_fs("tmpfs", "tmpfs", "/mnt", 0, "size=16m")?;
 
-    // 2. Parse kernel command line to get layer count.
-    let num_layers = parse_layers_from_cmdline()?;
-    eprintln!("bootstrap: {} layer(s) from cmdline", num_layers);
+    // 2. Parse kernel command line to get layer count and mount count.
+    let cmdline = fs::read_to_string("/proc/cmdline")?;
+    let num_layers = parse_cmdline_usize(&cmdline, "layers")?;
+    let num_mounts = parse_cmdline_usize(&cmdline, "mounts").unwrap_or(0);
+    eprintln!("bootstrap: {} layer(s), {} mount(s) from cmdline", num_layers, num_mounts);
 
-    // 3. Wait for SCSI devices (layers + patch + scratch = num_layers + 2).
-    //    The scratch VHDX is attached but we use tmpfs instead; still wait for it
-    //    so the SCSI bus is fully enumerated.
+    // 3. Wait for SCSI devices (layers + patch + scratch).
+    //    Mounts use 9p over vsock, not SCSI.
     let total_scsi = num_layers + 2;
     wait_for_scsi_devices(total_scsi)?;
 
@@ -145,6 +173,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = fs::remove_dir("/old_root");
 
     eprintln!("bootstrap: pivot_root complete");
+
+    // 10b. Mount host directories via 9p over vsock.
+    for (i, mount) in spec.mounts.iter().enumerate() {
+        let port = P9_BASE_PORT + i as u32;
+        let guest_path = &mount.guest_path;
+        if let Err(e) = fs::create_dir_all(guest_path) {
+            eprintln!("bootstrap: WARNING: could not create mount point {}: {}", guest_path, e);
+        }
+
+        match mount_9p_vsock(port, guest_path, mount.readonly) {
+            Ok(()) => eprintln!("bootstrap: mounted 9p at {} (vsock port {})", guest_path, port),
+            Err(e) => eprintln!(
+                "bootstrap: WARNING: 9p mount at {} failed: {}",
+                guest_path, e
+            ),
+        }
+    }
 
     // 11. Start portal daemon.
     let portal_path = "/usr/local/bin/portal";
@@ -329,6 +374,66 @@ fn power_off() -> ! {
 }
 
 //--------------------------------------------------------------------------------------------------
+// Vsock + 9p mount helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Connect to the host via vsock at the given port.
+/// Retries with exponential backoff since the p9 server may still be starting.
+fn vsock_connect(port: u32) -> io::Result<i32> {
+    let mut last_err = io::Error::new(io::ErrorKind::Other, "no attempts made");
+    for attempt in 1..=VSOCK_CONNECT_RETRIES {
+        let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let addr = SockaddrVm {
+            svm_family: AF_VSOCK as u16,
+            svm_reserved1: 0,
+            svm_port: port,
+            svm_cid: VMADDR_CID_HOST,
+            svm_zero: [0; 4],
+        };
+
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const SockaddrVm as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrVm>() as libc::socklen_t,
+            )
+        };
+
+        if ret == 0 {
+            return Ok(fd);
+        }
+
+        last_err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+
+        if attempt < VSOCK_CONNECT_RETRIES {
+            thread::sleep(Duration::from_millis(100 * attempt));
+        }
+    }
+    Err(last_err)
+}
+
+/// Mount a host directory via 9p over vsock.
+fn mount_9p_vsock(port: u32, guest_path: &str, readonly: bool) -> io::Result<()> {
+    let fd = vsock_connect(port)?;
+    let opts = format!(
+        "trans=fd,rfdno={},wfdno={},version=9p2000.L,msize=262144",
+        fd, fd
+    );
+    let mut flags: libc::c_ulong = libc::MS_NODEV | libc::MS_NOSUID;
+    if readonly {
+        flags |= libc::MS_RDONLY;
+    }
+    mount_fs("9p", "hostmount", guest_path, flags, &opts)?;
+    // Do NOT close fd — kernel takes ownership for the mount.
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
 // SCSI device helpers
 //--------------------------------------------------------------------------------------------------
 
@@ -371,15 +476,15 @@ fn wait_for_scsi_devices(count: usize) -> Result<(), Box<dyn std::error::Error>>
 // Kernel command line parsing
 //--------------------------------------------------------------------------------------------------
 
-/// Parse `layers=N` from `/proc/cmdline`.
-fn parse_layers_from_cmdline() -> Result<usize, Box<dyn std::error::Error>> {
-    let cmdline = fs::read_to_string("/proc/cmdline")?;
+/// Parse a `key=value` parameter from a kernel command line string.
+fn parse_cmdline_usize(cmdline: &str, key: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let prefix = format!("{}=", key);
     for param in cmdline.split_whitespace() {
-        if let Some(value) = param.strip_prefix("layers=") {
+        if let Some(value) = param.strip_prefix(&prefix) {
             return Ok(value.parse::<usize>()?);
         }
     }
-    Err("'layers=N' not found in /proc/cmdline".into())
+    Err(format!("'{}=N' not found in /proc/cmdline", key).into())
 }
 
 //--------------------------------------------------------------------------------------------------

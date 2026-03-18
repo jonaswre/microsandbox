@@ -5,6 +5,8 @@ package hcs
 import (
 	"fmt"
 	"strconv"
+
+	"github.com/Microsoft/go-winio/pkg/guid"
 )
 
 // ComputeConfig is the HCS compute system configuration, matching the Rust
@@ -20,6 +22,7 @@ type ComputeConfig struct {
 	Plan9Shares       []Plan9Share     `json:"plan9_shares"`
 	NetworkEndpointID *string          `json:"network_endpoint_id"`
 	ConsolePipePath   string           `json:"console_pipe_path,omitempty"`
+	PortalHostPort    *uint16          `json:"portal_host_port,omitempty"`
 }
 
 // ScsiAttachment represents a VHD to attach via SCSI.
@@ -44,6 +47,26 @@ const (
 	Plan9FlagLinuxMetadata uint32 = 0x4
 	Plan9FlagCaseSensitive uint32 = 0x8
 )
+
+// BaseMountPort is the first vsock port used for 9p mount shares.
+const BaseMountPort uint32 = 50000
+
+// hvSocketSecurityDescriptor grants full access to everyone (SDDL: Everyone = WD).
+// Required for HvSocket service entries so the host p9 server can bind and the
+// guest can connect via AF_VSOCK.
+const hvSocketSecurityDescriptor = "D:P(A;;FA;;;WD)"
+
+// PortToServiceGUID converts a vsock port number to the Hyper-V socket service GUID.
+// Uses the standard template: {XXXXXXXX-facb-11e6-bd58-64006a7986d3} where XXXXXXXX = hex port.
+// This is the same GUID format used by WSL2 for vsock-to-HvSocket mapping.
+func PortToServiceGUID(port uint32) guid.GUID {
+	return guid.GUID{
+		Data1: port,
+		Data2: 0xfacb,
+		Data3: 0x11e6,
+		Data4: [8]byte{0xbd, 0x58, 0x64, 0x00, 0x6a, 0x79, 0x86, 0xd3},
+	}
+}
 
 //--------------------------------------------------------------------------------------------------
 // HCS V2 Schema Types
@@ -103,10 +126,35 @@ type Processor struct {
 
 // Devices describes device attachments.
 type Devices struct {
-	Scsi            map[string]ScsiController  `json:"Scsi,omitempty"`
-	Plan9           map[string]Plan9ShareSchema `json:"Plan9,omitempty"`
-	NetworkAdapters map[string]NetworkAdapter   `json:"NetworkAdapters,omitempty"`
-	ComPorts        map[string]ComPort          `json:"ComPorts,omitempty"`
+	Scsi            map[string]ScsiController `json:"Scsi,omitempty"`
+	HvSocket        *HvSocketDevice           `json:"HvSocket,omitempty"`
+	Plan9           *Plan9Device              `json:"Plan9,omitempty"`
+	VirtioFs        *VirtioFsDevice           `json:"VirtioFs,omitempty"`
+	NetworkAdapters map[string]NetworkAdapter  `json:"NetworkAdapters,omitempty"`
+	ComPorts        map[string]ComPort         `json:"ComPorts,omitempty"`
+}
+
+// HvSocketDevice wraps HvSocket configuration in the HCS V2 schema.
+// Placed under Devices, not VirtualMachine.
+type HvSocketDevice struct {
+	HvSocketConfig *HvSocketSystemConfig `json:"HvSocketConfig,omitempty"`
+}
+
+// Plan9Device wraps Plan9 shares in the HCS V2 schema structure.
+// HCS expects { "Plan9": { "Shares": [...] } }, not a flat map.
+type Plan9Device struct {
+	Shares []Plan9ShareSchema `json:"Shares,omitempty"`
+}
+
+// VirtioFsDevice wraps VirtioFS shares in the HCS V2 schema structure.
+type VirtioFsDevice struct {
+	Shares []VirtioFsShareSchema `json:"Shares,omitempty"`
+}
+
+// VirtioFsShareSchema is the HCS schema VirtioFS share config.
+type VirtioFsShareSchema struct {
+	Name string `json:"Name,omitempty"`
+	Path string `json:"Path,omitempty"`
 }
 
 // ComPort describes a serial port redirected to a named pipe.
@@ -141,6 +189,20 @@ type NetworkAdapter struct {
 	EndpointID string `json:"EndpointId"`
 }
 
+// HvSocketSystemConfig configures Hyper-V socket services for the VM.
+// Used to register vsock service GUIDs that the host can listen on
+// and the guest can connect to via AF_VSOCK.
+type HvSocketSystemConfig struct {
+	ServiceTable map[string]HvSocketServiceEntry `json:"ServiceTable,omitempty"`
+}
+
+// HvSocketServiceEntry configures a single HvSocket service.
+type HvSocketServiceEntry struct {
+	BindSecurityDescriptor    string `json:"BindSecurityDescriptor,omitempty"`
+	ConnectSecurityDescriptor string `json:"ConnectSecurityDescriptor,omitempty"`
+	AllowWildcardBinds        bool   `json:"AllowWildcardBinds,omitempty"`
+}
+
 //--------------------------------------------------------------------------------------------------
 // Schema Builder
 //--------------------------------------------------------------------------------------------------
@@ -172,8 +234,9 @@ func BuildHcsDocument(cfg *ComputeConfig) *HcsDocument {
 				},
 			},
 			Devices: &Devices{
-				Scsi:  buildScsiControllers(cfg.ScsiAttachments),
-				Plan9: buildPlan9(cfg.Plan9Shares),
+				Scsi:     buildScsiControllers(cfg.ScsiAttachments),
+				HvSocket: buildHvSocket(cfg.Plan9Shares),
+				Plan9:    buildPlan9(cfg.Plan9Shares),
 			},
 		},
 	}
@@ -232,29 +295,75 @@ func buildScsiControllers(attachments []ScsiAttachment) map[string]ScsiControlle
 	return result
 }
 
-// buildPlan9 builds the Plan9 share map from share configs.
-func buildPlan9(shares []Plan9Share) map[string]Plan9ShareSchema {
+// buildPlan9 builds the Plan9 device from share configs.
+func buildPlan9(shares []Plan9Share) *Plan9Device {
 	if len(shares) == 0 {
 		return nil
 	}
 
-	result := make(map[string]Plan9ShareSchema)
+	var p9shares []Plan9ShareSchema
 	for i, s := range shares {
 		name := s.Name
 		if name == "" {
 			name = fmt.Sprintf("share_%d", i)
 		}
 
-		p9 := Plan9ShareSchema{
-			Name:     name,
+		p9shares = append(p9shares, Plan9ShareSchema{
+			Name:       name,
 			AccessName: name,
-			Path:     s.HostPath,
-			Flags:    int32(s.Flags),
-			ReadOnly: s.Flags&Plan9FlagReadOnly != 0,
-		}
-
-		result[name] = p9
+			Path:       s.HostPath,
+			Port:       int32(i + 1), // HCS requires a non-zero port per share
+			Flags:      int32(s.Flags),
+			ReadOnly:   s.Flags&Plan9FlagReadOnly != 0,
+		})
 	}
 
-	return result
+	return &Plan9Device{Shares: p9shares}
+}
+
+// buildHvSocket builds the HvSocket device with service table for 9p mounts over vsock.
+// Each Plan9 share gets a service table entry keyed by its vsock port GUID.
+func buildHvSocket(shares []Plan9Share) *HvSocketDevice {
+	if len(shares) == 0 {
+		return nil
+	}
+
+	table := make(map[string]HvSocketServiceEntry)
+	for i := range shares {
+		port := BaseMountPort + uint32(i)
+		guidStr := PortToServiceGUID(port).String()
+		table[guidStr] = HvSocketServiceEntry{
+			BindSecurityDescriptor:    hvSocketSecurityDescriptor,
+			ConnectSecurityDescriptor: hvSocketSecurityDescriptor,
+			AllowWildcardBinds:        true,
+		}
+	}
+
+	return &HvSocketDevice{
+		HvSocketConfig: &HvSocketSystemConfig{ServiceTable: table},
+	}
+}
+
+// buildVirtioFs builds the VirtioFS device from share configs.
+// VirtioFS is the modern alternative to Plan9 for host directory sharing.
+// NOTE: VirtioFS causes HCS Construct errors on Windows 11 build 26200.
+// Kept for future use when newer builds support it.
+func buildVirtioFs(shares []Plan9Share) *VirtioFsDevice { //nolint:unused
+	if len(shares) == 0 {
+		return nil
+	}
+
+	var vfsShares []VirtioFsShareSchema
+	for i, s := range shares {
+		name := s.Name
+		if name == "" {
+			name = fmt.Sprintf("share_%d", i)
+		}
+		vfsShares = append(vfsShares, VirtioFsShareSchema{
+			Name: name,
+			Path: s.HostPath,
+		})
+	}
+
+	return &VirtioFsDevice{Shares: vfsShares}
 }

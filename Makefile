@@ -57,7 +57,7 @@ endif
 # -----------------------------------------------------------------------------
 # Phony Targets Declaration
 # -----------------------------------------------------------------------------
-.PHONY: all build install clean build_libkrun example bench bin _run_example _run_bench _run_bin help uninstall microsandbox _build_aliases build_hcs_worker build_bootstrap build_portal_linux build_rootfs
+.PHONY: all build install clean build_libkrun example bench bin _run_example _run_bench _run_bin help uninstall microsandbox _build_aliases build_hcs_worker build_bootstrap build_portal_linux build_rootfs build_bundle_windows
 
 # -----------------------------------------------------------------------------
 # Main Targets
@@ -188,6 +188,10 @@ build_rootfs: build_bootstrap
 		target/$(BOOTSTRAP_TARGET)/release/portal \
 		$(BOOT_BUNDLE_DIR)/tar2ext4.exe \
 		$(BOOT_BUNDLE_DIR)/rootfs.vhd
+
+# Build the complete Windows boot bundle via PowerShell (requires cargo-zigbuild, python3, tar2ext4.exe)
+build_bundle_windows:
+	powershell -ExecutionPolicy Bypass -File scripts/Build-BootBundle.ps1
 
 # Catch-all target to allow example names and arguments
 %:

@@ -306,9 +306,11 @@ impl WindowsRootfsMaterializer {
             mounts: spec
                 .mounts
                 .iter()
-                .map(|m| GuestMountEntry {
+                .enumerate()
+                .map(|(i, m)| GuestMountEntry {
                     guest_path: m.guest.to_string(),
                     readonly: m.readonly,
+                    tag: Some(format!("mount_{}", i)),
                 })
                 .collect(),
             workdir: spec.workdir.as_ref().map(|w| w.to_string()),
@@ -519,6 +521,10 @@ struct SandboxSpecForGuest {
 struct GuestMountEntry {
     guest_path: String,
     readonly: bool,
+    /// Plan9 share tag used to mount this share inside the guest via 9p.
+    /// Corresponds to the `Name`/`AccessName` in the HCS Plan9 share config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -835,6 +841,54 @@ mod tests {
             .cleanup_sandbox("nonexistent~sandbox")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_materialized_rootfs_structure() {
+        let rootfs = WindowsMaterializedRootfs {
+            layer_vhds: vec![PathBuf::from("/cache/layer0.vhd")],
+            patch_vhd: PathBuf::from("/runtime/patch.vhd"),
+            scratch_vhdx: PathBuf::from("/runtime/scratch.vhdx"),
+        };
+
+        assert_eq!(rootfs.layer_vhds.len(), 1);
+        assert_eq!(rootfs.patch_vhd, PathBuf::from("/runtime/patch.vhd"));
+        assert_eq!(rootfs.scratch_vhdx, PathBuf::from("/runtime/scratch.vhdx"));
+    }
+
+    #[test]
+    fn test_guest_mount_entry_with_tag() {
+        // 9p-backed mounts have a tag for share identification.
+        let entry = GuestMountEntry {
+            guest_path: "/mnt/host".to_string(),
+            readonly: true,
+            tag: Some("mount_0".to_string()),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("mount_0"));
+
+        let deserialized: GuestMountEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.tag.as_deref(), Some("mount_0"));
+        assert_eq!(deserialized.guest_path, "/mnt/host");
+        assert!(deserialized.readonly);
+    }
+
+    #[test]
+    fn test_guest_mount_entry_tag_none() {
+        // Backward compatibility: tag can be None.
+        let entry = GuestMountEntry {
+            guest_path: "/mnt/host".to_string(),
+            readonly: false,
+            tag: None,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        // tag should be omitted when None (skip_serializing_if).
+        assert!(!json.contains("tag"));
+
+        let deserialized: GuestMountEntry = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.tag.is_none());
     }
 
     #[tokio::test]

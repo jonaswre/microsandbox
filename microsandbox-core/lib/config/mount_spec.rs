@@ -233,13 +233,36 @@ impl FromStr for MountSpec {
 
         #[cfg(windows)]
         {
-            if s.contains(':') {
-                return Err(MicrosandboxError::InvalidMountSpec(format!(
-                    "colon-delimited mount syntax is ambiguous on Windows: \"{}\". \
-                     Use structured mount syntax instead: {{ host: \"...\", guest: \"...\" }}",
-                    s
-                )));
+            // On Windows, drive letter paths (e.g., C:\foo) contain a colon that is NOT
+            // a host:guest delimiter. Detect the drive letter prefix and look for the
+            // delimiter colon after it.
+            let delimiter_pos = if s.len() >= 3
+                && s.as_bytes()[0].is_ascii_alphabetic()
+                && s.as_bytes()[1] == b':'
+                && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/')
+            {
+                // Drive letter detected (e.g., "C:\..."), skip drive colon.
+                s[2..].find(':').map(|p| p + 2)
+            } else {
+                s.find(':')
+            };
+
+            if let Some(pos) = delimiter_pos {
+                let host = &s[..pos];
+                let guest = &s[pos + 1..];
+                if host.is_empty() || guest.is_empty() {
+                    return Err(MicrosandboxError::InvalidMountSpec(format!(
+                        "invalid mount spec: \"{}\"",
+                        s
+                    )));
+                }
+                return Ok(MountSpec {
+                    host: HostPathBuf(PathBuf::from(host)),
+                    guest: GuestPathBuf::from(guest),
+                    readonly: false,
+                });
             }
+
             return Ok(MountSpec {
                 host: HostPathBuf(PathBuf::from(s)),
                 guest: GuestPathBuf::from(s),
@@ -422,6 +445,31 @@ mod tests {
         let mount: MountSpec = "/data:/data".parse().unwrap();
         assert_eq!(mount.host.to_string(), "/data");
         assert_eq!(mount.guest.as_str(), "/data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_mount_spec_from_str_windows_drive_letter() {
+        let mount: MountSpec = r"C:\temp\share:/mnt/share".parse().unwrap();
+        assert_eq!(mount.host.to_string(), r"C:\temp\share");
+        assert_eq!(mount.guest.as_str(), "/mnt/share");
+        assert!(!mount.readonly);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_mount_spec_from_str_windows_drive_only() {
+        // No delimiter colon — just a Windows path
+        let mount: MountSpec = r"C:\data".parse().unwrap();
+        assert_eq!(mount.host.to_string(), r"C:\data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_mount_spec_from_str_windows_forward_slash() {
+        let mount: MountSpec = "C:/temp/share:/mnt/share".parse().unwrap();
+        assert_eq!(mount.host.to_string(), "C:/temp/share");
+        assert_eq!(mount.guest.as_str(), "/mnt/share");
     }
 
     #[test]

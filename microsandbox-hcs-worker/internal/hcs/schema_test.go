@@ -2,6 +2,7 @@ package hcs
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -106,19 +107,31 @@ func TestBuildHcsDocument_Plan9Shares(t *testing.T) {
 
 	plan9 := doc.VirtualMachine.Devices.Plan9
 	if plan9 == nil {
-		t.Fatal("Plan9 shares should not be nil")
+		t.Fatal("Plan9 device should not be nil")
+	}
+	if len(plan9.Shares) != 2 {
+		t.Fatalf("expected 2 Plan9 shares, got %d", len(plan9.Shares))
 	}
 
-	ctrl, ok := plan9["control"]
-	if !ok {
+	// Find shares by name.
+	var ctrl, mount0 *Plan9ShareSchema
+	for i := range plan9.Shares {
+		switch plan9.Shares[i].Name {
+		case "control":
+			ctrl = &plan9.Shares[i]
+		case "mount_0":
+			mount0 = &plan9.Shares[i]
+		}
+	}
+
+	if ctrl == nil {
 		t.Fatal("expected 'control' share")
 	}
 	if !ctrl.ReadOnly {
 		t.Error("control share should be read-only")
 	}
 
-	mount0, ok := plan9["mount_0"]
-	if !ok {
+	if mount0 == nil {
 		t.Fatal("expected 'mount_0' share")
 	}
 	if mount0.ReadOnly {
@@ -215,6 +228,108 @@ func TestBuildHcsDocument_ComPorts(t *testing.T) {
 	}
 }
 
+func TestBuildHcsDocument_HvSockets(t *testing.T) {
+	cfg := &ComputeConfig{
+		Name:       "test",
+		KernelPath: `C:\boot\kernel`,
+		InitrdPath: `C:\boot\rootfs.vhd`,
+		MemoryMiB:  256,
+		VcpuCount:  1,
+		Plan9Shares: []Plan9Share{
+			{Name: "mount_0", HostPath: `C:\project`, GuestPath: "/workspace", Flags: Plan9FlagLinuxMetadata | Plan9FlagCaseSensitive},
+			{Name: "mount_1", HostPath: `C:\data`, GuestPath: "/data", Flags: Plan9FlagReadOnly | Plan9FlagLinuxMetadata | Plan9FlagCaseSensitive},
+		},
+	}
+
+	doc := BuildHcsDocument(cfg)
+
+	hvSocket := doc.VirtualMachine.Devices.HvSocket
+	if hvSocket == nil || hvSocket.HvSocketConfig == nil {
+		t.Fatal("HvSocket device should not be nil when Plan9 shares are present")
+	}
+	hvsockets := hvSocket.HvSocketConfig
+	if len(hvsockets.ServiceTable) != 2 {
+		t.Fatalf("expected 2 service table entries, got %d", len(hvsockets.ServiceTable))
+	}
+
+	// Verify GUID for port 50000 (0xC350).
+	entry0, ok := hvsockets.ServiceTable["0000c350-facb-11e6-bd58-64006a7986d3"]
+	if !ok {
+		t.Fatal("expected service table entry for port 50000")
+	}
+	if entry0.BindSecurityDescriptor != "D:P(A;;FA;;;WD)" {
+		t.Errorf("unexpected bind SD: %s", entry0.BindSecurityDescriptor)
+	}
+	if entry0.ConnectSecurityDescriptor != "D:P(A;;FA;;;WD)" {
+		t.Errorf("unexpected connect SD: %s", entry0.ConnectSecurityDescriptor)
+	}
+	if !entry0.AllowWildcardBinds {
+		t.Error("AllowWildcardBinds should be true")
+	}
+
+	// Verify GUID for port 50001 (0xC351).
+	_, ok = hvsockets.ServiceTable["0000c351-facb-11e6-bd58-64006a7986d3"]
+	if !ok {
+		t.Fatal("expected service table entry for port 50001")
+	}
+}
+
+func TestBuildHcsDocument_HvSockets_Empty(t *testing.T) {
+	cfg := &ComputeConfig{
+		Name:       "test",
+		KernelPath: `C:\boot\kernel`,
+		InitrdPath: `C:\boot\rootfs.vhd`,
+		MemoryMiB:  256,
+		VcpuCount:  1,
+	}
+
+	doc := BuildHcsDocument(cfg)
+	if doc.VirtualMachine.Devices.HvSocket != nil {
+		t.Error("HvSocket device should be nil when no Plan9 shares are present")
+	}
+}
+
+func TestBuildHcsDocument_HvSockets_JSONRoundtrip(t *testing.T) {
+	cfg := &ComputeConfig{
+		Name:       "test",
+		KernelPath: `C:\boot\kernel`,
+		InitrdPath: `C:\boot\rootfs.vhd`,
+		MemoryMiB:  256,
+		VcpuCount:  1,
+		Plan9Shares: []Plan9Share{
+			{Name: "mount_0", HostPath: `C:\project`, GuestPath: "/workspace", Flags: 0xC},
+		},
+	}
+
+	doc := BuildHcsDocument(cfg)
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	// Verify HvSocket key is present in JSON.
+	jsonStr := string(data)
+	if !strings.Contains(jsonStr, "HvSocket") {
+		t.Error("JSON should contain HvSocket key")
+	}
+	if !strings.Contains(jsonStr, "ServiceTable") {
+		t.Error("JSON should contain ServiceTable key")
+	}
+
+	// Roundtrip.
+	var roundtrip HcsDocument
+	if err := json.Unmarshal(data, &roundtrip); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if roundtrip.VirtualMachine.Devices.HvSocket == nil {
+		t.Fatal("HvSocket should survive JSON roundtrip")
+	}
+	if len(roundtrip.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable) != 1 {
+		t.Errorf("expected 1 service table entry after roundtrip, got %d",
+			len(roundtrip.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable))
+	}
+}
+
 func TestBuildHcsDocument_NoComPorts(t *testing.T) {
 	cfg := &ComputeConfig{
 		Name:       "test",
@@ -256,6 +371,56 @@ func TestComputeConfig_ConsolePipeDeserialization(t *testing.T) {
 	}
 	if config.ConsolePipePath != `\\.\pipe\microsandbox-console-test~sandbox` {
 		t.Errorf("unexpected console pipe path: %q", config.ConsolePipePath)
+	}
+}
+
+func TestComputeConfig_PortalHostPortDeserialization(t *testing.T) {
+	input := `{
+		"name": "test",
+		"kernel_path": "C:\\boot\\kernel",
+		"initrd_path": "C:\\boot\\rootfs.vhd",
+		"kernel_cmdline": "init=/bootstrap console=ttyS0 panic=1 layers=1",
+		"memory_mib": 256,
+		"vcpu_count": 1,
+		"scsi_attachments": [],
+		"plan9_shares": [],
+		"network_endpoint_id": null,
+		"portal_host_port": 52345
+	}`
+
+	var config ComputeConfig
+	if err := json.Unmarshal([]byte(input), &config); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if config.PortalHostPort == nil {
+		t.Fatal("PortalHostPort should not be nil")
+	}
+	if *config.PortalHostPort != 52345 {
+		t.Errorf("expected 52345, got %d", *config.PortalHostPort)
+	}
+}
+
+func TestComputeConfig_PortalHostPortOmitted(t *testing.T) {
+	input := `{
+		"name": "test",
+		"kernel_path": "C:\\boot\\kernel",
+		"initrd_path": "C:\\boot\\rootfs.vhd",
+		"kernel_cmdline": "init=/bootstrap console=ttyS0 panic=1 layers=1",
+		"memory_mib": 256,
+		"vcpu_count": 1,
+		"scsi_attachments": [],
+		"plan9_shares": [],
+		"network_endpoint_id": null
+	}`
+
+	var config ComputeConfig
+	if err := json.Unmarshal([]byte(input), &config); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if config.PortalHostPort != nil {
+		t.Error("PortalHostPort should be nil when omitted")
 	}
 }
 

@@ -74,6 +74,10 @@ pub struct HcsComputeConfig {
     /// Named pipe path for serial console redirection (COM1 → ttyS0).
     /// When set, HCS creates a named pipe server and the worker relays I/O.
     pub console_pipe_path: Option<String>,
+
+    /// Host port to proxy to the guest portal (port 4444).
+    /// When set, the worker starts a TCP relay on `127.0.0.1:<port>`.
+    pub portal_host_port: Option<u16>,
 }
 
 /// A VHD to attach via SCSI to the compute system.
@@ -194,10 +198,25 @@ impl WindowsHcsBackend {
             lun,
         });
 
-        // Plan9 shares for host directory mounts.
-        // TODO: Re-enable Plan9 shares once HCS schema compatibility is resolved.
-        // On some Windows 11 builds, Plan9 in the HCS V2 schema causes Construct errors.
-        let plan9_shares = Vec::new();
+        // Plan9 shares for live bidirectional host directory sharing via 9p over vsock.
+        let plan9_shares: Vec<Plan9Share> = spec
+            .mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let flags = if m.readonly {
+                    PLAN9_FLAG_READONLY | PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE
+                } else {
+                    PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE
+                };
+                Plan9Share {
+                    name: format!("mount_{}", i),
+                    host_path: m.host.as_path().display().to_string(),
+                    guest_path: m.guest.as_str().to_string(),
+                    flags,
+                }
+            })
+            .collect();
 
         HcsComputeConfig {
             name: spec.sandbox_key.clone(),
@@ -214,8 +233,9 @@ impl WindowsHcsBackend {
                 .display()
                 .to_string(),
             kernel_cmdline: format!(
-                "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={}",
-                rootfs.layer_vhds.len()
+                "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={} mounts={}",
+                rootfs.layer_vhds.len(),
+                spec.mounts.len()
             ),
             memory_mib: spec.resources.memory_mib,
             vcpu_count: spec.resources.vcpus,
@@ -226,6 +246,11 @@ impl WindowsHcsBackend {
                 r"\\.\pipe\microsandbox-console-{}",
                 spec.sandbox_key
             )),
+            portal_host_port: spec
+                .ports
+                .iter()
+                .find(|p| p.get_guest() == 4444)
+                .map(|p| p.get_host()),
         }
     }
 
@@ -284,6 +309,38 @@ impl WindowsHcsBackend {
         }
     }
 
+    /// Checks if the current process is running with administrator privileges.
+    ///
+    /// HCS and HCN APIs require elevation. Calling this early produces an
+    /// actionable error instead of cryptic HRESULT failures deeper in the stack.
+    pub async fn check_admin_elevated() -> MicrosandboxResult<()> {
+        let output = tokio::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)",
+            ])
+            .output()
+            .await
+            .map_err(|e| {
+                MicrosandboxError::NotImplemented(format!(
+                    "Failed to check administrator status: {}. Ensure PowerShell is available.",
+                    e
+                ))
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().eq_ignore_ascii_case("True") {
+            return Ok(());
+        }
+
+        Err(MicrosandboxError::NotImplemented(
+            "Administrator privileges required. HCS and HCN APIs need elevation. \
+             Please run this command from an elevated (Run as Administrator) terminal."
+                .to_string(),
+        ))
+    }
+
     /// Checks if Hyper-V is available on the system.
     ///
     /// Uses WMI `HypervisorPresent` (no admin required) with a fallback to
@@ -339,8 +396,16 @@ impl WindowsHcsBackend {
 #[async_trait]
 impl VmBackend for WindowsHcsBackend {
     async fn start(&self, spec: &ResolvedSandboxSpec) -> MicrosandboxResult<RuntimeHandle> {
-        // Check Hyper-V availability first.
+        // Check prerequisites: admin privileges then Hyper-V availability.
+        Self::check_admin_elevated().await?;
         Self::check_hyperv_available().await?;
+
+        // Generate a unique session ID for this invocation. This prevents named
+        // pipe conflicts when `msb exe` is run multiple times in quick succession
+        // — Windows holds closed pipes in a TIME_WAIT-like state, so reusing the
+        // same pipe name causes "Access denied" errors.
+        let runtime_id = uuid_v4_string();
+        let session_suffix = &runtime_id[..8];
 
         // Materialize rootfs (convert OCI layers to VHDs).
         let rootfs_config = super::rootfs::WindowsRootfsConfig {
@@ -358,23 +423,29 @@ impl VmBackend for WindowsHcsBackend {
         Self::grant_vm_access(&self.config.runtime_dir).await;
         Self::grant_vm_access(&self.config.boot_bundle_dir).await;
 
-        // Build compute configuration.
-        // Networking (HCN NAT + endpoint + load balancers) is set up by the Go
-        // worker via native Win32 HCN API calls, not PowerShell. The worker
-        // creates the endpoint and sets NetworkEndpointID before starting HCS.
-        let compute_config = self.build_compute_config(spec, &rootfs);
+        // Build compute configuration with session-scoped names to avoid conflicts.
+        let mut compute_config = self.build_compute_config(spec, &rootfs);
+        compute_config.name = format!("{}-{}", spec.sandbox_key, session_suffix);
+        compute_config.console_pipe_path = Some(format!(
+            r"\\.\pipe\microsandbox-console-{}-{}",
+            spec.sandbox_key, session_suffix
+        ));
         let config_json = serde_json::to_string(&compute_config)?;
 
-        // Create the named pipe control channel path.
-        let pipe_path = Self::pipe_path(&spec.sandbox_key);
+        // Create a session-scoped named pipe control channel path.
+        let pipe_path = format!(
+            r"\\.\pipe\microsandbox-{}-{}",
+            spec.sandbox_key, session_suffix
+        );
 
-        // Write the compute config to the sandbox directory for the worker to read.
+        // Write the compute config to a session-scoped directory so parallel
+        // invocations with the same sandbox_key don't overwrite each other.
         let sandbox_dir = self
             .config
             .runtime_dir
             .join("windows")
             .join("sandboxes")
-            .join(&spec.sandbox_key);
+            .join(format!("{}-{}", &spec.sandbox_key, session_suffix));
         tokio::fs::create_dir_all(&sandbox_dir).await?;
         let config_path = sandbox_dir.join("compute-config.json");
         tokio::fs::write(&config_path, &config_json).await?;
@@ -407,7 +478,7 @@ impl VmBackend for WindowsHcsBackend {
         Ok(RuntimeHandle {
             sandbox_key: spec.sandbox_key.clone(),
             backend_kind: BackendKind::WindowsHcs,
-            runtime_id: uuid_v4_string(),
+            runtime_id,
             worker_pid,
             control_endpoint: pipe_path,
             backend_object_id: compute_config.name,
@@ -505,23 +576,27 @@ impl VmBackend for WindowsHcsBackend {
 // Helper functions
 //--------------------------------------------------------------------------------------------------
 
-/// Generates a UUID v4 string for runtime IDs.
+/// Generates a pseudo-UUID v4 string for runtime IDs.
+///
+/// Uses the process ID for the first segment (unique across concurrent
+/// invocations) and nanosecond timestamp for the remaining segments (unique
+/// across sequential invocations from the same PID).
 fn uuid_v4_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let now = SystemTime::now()
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let nanos = now.as_nanos();
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id();
 
-    // Simple pseudo-UUID from timestamp + random bits from hash.
     format!(
         "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (nanos >> 96) as u32,
-        (nanos >> 80) as u16,
-        (nanos >> 64) as u16 & 0xfff,
-        ((nanos >> 48) as u16 & 0x3fff) | 0x8000,
-        nanos as u64 & 0xffffffffffff,
+        pid,
+        (nanos >> 48) as u16,
+        (nanos >> 36) as u16 & 0xfff,
+        ((nanos >> 24) as u16 & 0x3fff) | 0x8000,
+        nanos & 0xffffffffffff,
     )
 }
 
@@ -532,6 +607,31 @@ fn uuid_v4_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::spec::{ExecSpec, ResolvedSandboxSpec, ResourceLimits, RootfsSource};
+    use crate::config::{NetworkScope, PortPair};
+
+    /// Creates a minimal `ResolvedSandboxSpec` for testing.
+    fn make_test_spec(sandbox_key: &str) -> ResolvedSandboxSpec {
+        ResolvedSandboxSpec {
+            sandbox_key: sandbox_key.to_string(),
+            rootfs_source: RootfsSource::Overlayfs {
+                layers: vec![],
+                rw_dir: PathBuf::from(r"C:\rw"),
+                patch_dir: PathBuf::from(r"C:\patch"),
+            },
+            mounts: vec![],
+            ports: vec![],
+            env: vec![],
+            workdir: None,
+            exec: ExecSpec {
+                path: typed_path::Utf8UnixPathBuf::from("/bin/sh"),
+                args: vec![],
+            },
+            resources: ResourceLimits::default(),
+            scope: NetworkScope::default(),
+            portal: None,
+        }
+    }
 
     #[test]
     fn test_pipe_path() {
@@ -609,6 +709,7 @@ mod tests {
             }],
             network_endpoint_id: None,
             console_pipe_path: Some(r"\\.\pipe\microsandbox-console-test".to_string()),
+            portal_host_port: None,
         };
 
         let json = serde_json::to_string_pretty(&config).unwrap();
@@ -634,13 +735,125 @@ mod tests {
     #[test]
     fn test_kernel_cmdline_format() {
         let cmdline = format!(
-            "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={}",
-            3
+            "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={} mounts={}",
+            3, 2
         );
         assert!(cmdline.contains("init=/bootstrap"));
         assert!(cmdline.contains("console=ttyS0"));
         assert!(cmdline.contains("layers=3"));
+        assert!(cmdline.contains("mounts=2"));
         assert!(cmdline.contains("panic=1"));
+    }
+
+    #[test]
+    fn test_kernel_cmdline_zero_mounts() {
+        let cmdline = format!(
+            "root=/dev/ram0 init=/bootstrap console=ttyS0 panic=1 layers={} mounts={}",
+            2, 0
+        );
+        assert!(cmdline.contains("layers=2"));
+        assert!(cmdline.contains("mounts=0"));
+    }
+
+    #[test]
+    fn test_scsi_lun_numbering() {
+        use super::super::rootfs::WindowsMaterializedRootfs;
+
+        let rootfs = WindowsMaterializedRootfs {
+            layer_vhds: vec![
+                PathBuf::from(r"C:\cache\layer0.vhd"),
+                PathBuf::from(r"C:\cache\layer1.vhd"),
+            ],
+            patch_vhd: PathBuf::from(r"C:\runtime\patch.vhd"),
+            scratch_vhdx: PathBuf::from(r"C:\runtime\scratch.vhdx"),
+        };
+
+        let config = WindowsHcsConfig {
+            boot_bundle_dir: PathBuf::from(r"C:\boot"),
+            worker_path: PathBuf::from(r"C:\msbrun-hcs.exe"),
+            cache_dir: PathBuf::from(r"C:\cache"),
+            runtime_dir: PathBuf::from(r"C:\runtime"),
+        };
+        let backend = WindowsHcsBackend::new(config);
+
+        let spec = make_test_spec("test~sandbox");
+        let compute = backend.build_compute_config(&spec, &rootfs);
+
+        // Expected LUN layout: 0: layer0, 1: layer1, 2: patch, 3: scratch
+        // (mounts use 9p over vsock, not SCSI)
+        assert_eq!(compute.scsi_attachments.len(), 4);
+        assert_eq!(compute.scsi_attachments[0].lun, 0); // layer0
+        assert_eq!(compute.scsi_attachments[1].lun, 1); // layer1
+        assert_eq!(compute.scsi_attachments[2].lun, 2); // patch
+        assert_eq!(compute.scsi_attachments[3].lun, 3); // scratch
+
+        // Verify readonly flags.
+        assert!(compute.scsi_attachments[0].readonly);  // layer: ro
+        assert!(compute.scsi_attachments[2].readonly);  // patch: ro
+        assert!(!compute.scsi_attachments[3].readonly); // scratch: rw
+
+        // Verify kernel cmdline (no mounts in this spec).
+        assert!(compute.kernel_cmdline.contains("layers=2"));
+        assert!(compute.kernel_cmdline.contains("mounts=0"));
+    }
+
+    #[test]
+    fn test_plan9_shares_from_mounts() {
+        use super::super::rootfs::WindowsMaterializedRootfs;
+        use crate::config::{GuestPathBuf, HostPathBuf, MountSpec};
+
+        let rootfs = WindowsMaterializedRootfs {
+            layer_vhds: vec![PathBuf::from(r"C:\cache\layer0.vhd")],
+            patch_vhd: PathBuf::from(r"C:\runtime\patch.vhd"),
+            scratch_vhdx: PathBuf::from(r"C:\runtime\scratch.vhdx"),
+        };
+
+        let config = WindowsHcsConfig {
+            boot_bundle_dir: PathBuf::from(r"C:\boot"),
+            worker_path: PathBuf::from(r"C:\msbrun-hcs.exe"),
+            cache_dir: PathBuf::from(r"C:\cache"),
+            runtime_dir: PathBuf::from(r"C:\runtime"),
+        };
+        let backend = WindowsHcsBackend::new(config);
+
+        let mut spec = make_test_spec("test~sandbox");
+        spec.mounts = vec![
+            MountSpec::new(
+                HostPathBuf::from(r"C:\Users\jonas\project"),
+                GuestPathBuf::from("/workspace"),
+                false,
+            ),
+            MountSpec::new(
+                HostPathBuf::from(r"C:\data\readonly"),
+                GuestPathBuf::from("/data"),
+                true,
+            ),
+        ];
+
+        let compute = backend.build_compute_config(&spec, &rootfs);
+
+        // SCSI should only have layers + patch + scratch (no mount VHDs).
+        assert_eq!(compute.scsi_attachments.len(), 3);
+
+        // Plan9 shares should be populated from mounts.
+        assert_eq!(compute.plan9_shares.len(), 2);
+        assert_eq!(compute.plan9_shares[0].name, "mount_0");
+        assert_eq!(compute.plan9_shares[0].host_path, r"C:\Users\jonas\project");
+        assert_eq!(compute.plan9_shares[0].guest_path, "/workspace");
+        assert_eq!(
+            compute.plan9_shares[0].flags,
+            PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE
+        );
+
+        assert_eq!(compute.plan9_shares[1].name, "mount_1");
+        assert_eq!(compute.plan9_shares[1].guest_path, "/data");
+        assert_eq!(
+            compute.plan9_shares[1].flags,
+            PLAN9_FLAG_READONLY | PLAN9_FLAG_LINUX_METADATA | PLAN9_FLAG_CASE_SENSITIVE
+        );
+
+        // Kernel cmdline should have mounts=2.
+        assert!(compute.kernel_cmdline.contains("mounts=2"));
     }
 
     #[test]
@@ -680,6 +893,7 @@ mod tests {
             plan9_shares: vec![],
             network_endpoint_id: None,
             console_pipe_path: Some(r"\\.\pipe\microsandbox-console-test".to_string()),
+            portal_host_port: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -691,5 +905,80 @@ mod tests {
             deserialized.console_pipe_path.as_deref(),
             Some(r"\\.\pipe\microsandbox-console-test")
         );
+    }
+
+    #[tokio::test]
+    async fn test_check_admin_elevated_returns_result() {
+        let result = WindowsHcsBackend::check_admin_elevated().await;
+        // In CI or non-admin contexts this returns an error containing "Administrator".
+        // In an admin terminal it returns Ok. Either is valid — just verify the function works.
+        match result {
+            Ok(()) => {} // running elevated
+            Err(e) => {
+                let msg = format!("{}", e);
+                assert!(
+                    msg.contains("Administrator"),
+                    "Error should mention Administrator: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_portal_host_port_from_spec() {
+        use super::super::rootfs::WindowsMaterializedRootfs;
+        use crate::config::PortPair;
+
+        let rootfs = WindowsMaterializedRootfs {
+            layer_vhds: vec![PathBuf::from(r"C:\cache\layer0.vhd")],
+            patch_vhd: PathBuf::from(r"C:\runtime\patch.vhd"),
+            scratch_vhdx: PathBuf::from(r"C:\runtime\scratch.vhdx"),
+        };
+
+        let config = WindowsHcsConfig {
+            boot_bundle_dir: PathBuf::from(r"C:\boot"),
+            worker_path: PathBuf::from(r"C:\msbrun-hcs.exe"),
+            cache_dir: PathBuf::from(r"C:\cache"),
+            runtime_dir: PathBuf::from(r"C:\runtime"),
+        };
+        let backend = WindowsHcsBackend::new(config);
+
+        // Spec with a port pair mapping host 52345 → guest 4444.
+        let mut spec = make_test_spec("test~portal");
+        spec.ports = vec![PortPair::with_distinct(52345, 4444)];
+
+        let compute = backend.build_compute_config(&spec, &rootfs);
+        assert_eq!(compute.portal_host_port, Some(52345));
+
+        // Spec without the portal port → None.
+        let mut spec_no_portal = make_test_spec("test~noportal");
+        spec_no_portal.ports = vec![PortPair::with_same(8080)];
+
+        let compute2 = backend.build_compute_config(&spec_no_portal, &rootfs);
+        assert!(compute2.portal_host_port.is_none());
+    }
+
+    #[test]
+    fn test_portal_host_port_serialization() {
+        let config = HcsComputeConfig {
+            name: "test".to_string(),
+            kernel_path: r"C:\boot\kernel".to_string(),
+            initrd_path: r"C:\boot\rootfs.vhd".to_string(),
+            kernel_cmdline: "init=/bootstrap console=ttyS0 panic=1 layers=1".to_string(),
+            memory_mib: 256,
+            vcpu_count: 1,
+            scsi_attachments: vec![],
+            plan9_shares: vec![],
+            network_endpoint_id: None,
+            console_pipe_path: None,
+            portal_host_port: Some(52345),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("52345"));
+
+        let deserialized: HcsComputeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.portal_host_port, Some(52345));
     }
 }
